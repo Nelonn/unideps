@@ -1,0 +1,578 @@
+use crate::project::{Project, check_files, connect_graph};
+use crate::source::Sources;
+use crate::util::{parse_bool, parse_define, resolve_msvc_runtime, toolchain_fingerprint, warn};
+use anyhow::{Context, Result};
+use clap::Args;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use unideps_builder::git::GitSource;
+use unideps_builder::lock::FileLock;
+use unideps_builder::runners::cmake::{CMakeBuild, CMakeRunner};
+use unideps_builder::storage::StorageManager;
+use unideps_cache::packager::Packager;
+use unideps_cmake::generator::CMakeGenerator;
+use unideps_core::compiler::CompilerType;
+use unideps_core::graph::{DependencyGraph, DependencyNode, Direction, NodeIndex, NodeKind};
+use unideps_core::hash::HashCalculator;
+use unideps_core::manifest::Preset;
+use unideps_core::strategy::{EffectiveConfig, StrategyEngine};
+use unideps_core::target::{Arch, BuildType, Environment, Os, TargetTriple, VCRuntime};
+
+#[derive(Args, Debug, Default)]
+pub struct BuildArgs {
+    /// Path to unideps.toml
+    #[arg(short, long, default_value = "unideps.toml")]
+    pub manifest: PathBuf,
+
+    /// Target triple (default: host)
+    #[arg(short, long)]
+    pub target: Option<String>,
+
+    /// Preset from [presets]
+    #[arg(short, long)]
+    pub preset: Option<String>,
+
+    /// Debug, Release, RelWithDebInfo or MinSizeRel
+    #[arg(long)]
+    pub build_type: Option<String>,
+
+    /// Default linkage for dependencies that do not set `shared` (ON/OFF, true/false)
+    #[arg(long, value_parser = parse_bool)]
+    pub default_shared: Option<bool>,
+
+    /// MSVC runtime (MultiThreaded[Debug][DLL]; `$<$<CONFIG:..>:..>` expressions are expanded)
+    #[arg(long, allow_hyphen_values = true)]
+    pub msvc_runtime: Option<String>,
+
+    #[arg(long)]
+    pub c_compiler: Option<PathBuf>,
+
+    #[arg(long)]
+    pub cxx_compiler: Option<PathBuf>,
+
+    /// Compiler family: clang, msvc, gcc or a custom name
+    #[arg(long)]
+    pub compiler: Option<String>,
+
+    #[arg(long)]
+    pub toolchain_file: Option<PathBuf>,
+
+    /// `-DKEY=VALUE` options: evaluated by `enabled_if`; ANDROID_* ones are forwarded to builds
+    #[arg(long, allow_hyphen_values = true)]
+    pub cmake_args: Vec<String>,
+
+    /// Where to write the generated CMake targets file
+    #[arg(long)]
+    pub generate_targets: Option<PathBuf>,
+
+    /// Storage directory (default: $UNIDEPS_DIR, .local.toml storage.base_dir, ~/.unideps)
+    #[arg(long)]
+    pub base_dir: Option<PathBuf>,
+}
+
+fn detect_default_compiler(target: &TargetTriple) -> CompilerType {
+    match (target.os, target.env) {
+        (Os::Android | Os::Ios | Os::Macos | Os::Emscripten, _) => CompilerType::Clang,
+        (Os::Windows, Environment::Gnu) => CompilerType::Gcc,
+        (Os::Windows, _) => CompilerType::Msvc,
+        _ => CompilerType::Gcc,
+    }
+}
+
+fn android_abi(arch: Arch) -> &'static str {
+    match arch {
+        Arch::Arm64 => "arm64-v8a",
+        Arch::Arm => "armeabi-v7a",
+        Arch::X86_64 => "x86_64",
+        Arch::X86 => "x86",
+        _ => "arm64-v8a",
+    }
+}
+
+struct BuildContext<'a> {
+    project: &'a Project,
+    target: TargetTriple,
+    host: TargetTriple,
+    strategy: StrategyEngine,
+    storage: StorageManager,
+    c_compiler: Option<PathBuf>,
+    cxx_compiler: Option<PathBuf>,
+    toolchain_file: Option<PathBuf>,
+    target_compiler: CompilerType,
+    host_compiler: CompilerType,
+    target_base: EffectiveConfig,
+    default_shared: Option<bool>,
+    forwarded: BTreeMap<String, String>,
+}
+
+impl BuildContext<'_> {
+    fn is_native(&self) -> bool {
+        self.target.raw == self.host.raw && self.toolchain_file.is_none()
+    }
+
+    fn triple_for(&self, node: &DependencyNode) -> &TargetTriple {
+        match node.kind {
+            NodeKind::TargetDependency => &self.target,
+            NodeKind::HostTool => &self.host,
+        }
+    }
+
+    /// Host tools are built for the host with the host's default toolchain. They only
+    /// reuse the project's compilers when not cross-compiling.
+    fn compilers_for(&self, node: &DependencyNode) -> (Option<&Path>, Option<&Path>, Option<&Path>) {
+        match node.kind {
+            NodeKind::TargetDependency => (
+                self.c_compiler.as_deref(),
+                self.cxx_compiler.as_deref(),
+                self.toolchain_file.as_deref(),
+            ),
+            NodeKind::HostTool if self.is_native() => (self.c_compiler.as_deref(), self.cxx_compiler.as_deref(), None),
+            NodeKind::HostTool => (None, None, None),
+        }
+    }
+
+    fn configure_node(&self, node: &mut DependencyNode, dependents: &[&str]) {
+        let base = match node.kind {
+            NodeKind::TargetDependency => {
+                if node.shared.is_none() {
+                    node.shared = self.default_shared;
+                }
+                // Stored in node options so they are hashed: ANDROID_STL changes the ABI.
+                for (k, v) in &self.forwarded {
+                    node.cmake_options.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                if self.target.os == Os::Android && !node.cmake_options.contains_key("ANDROID_ABI") {
+                    node.cmake_options
+                        .insert("ANDROID_ABI".into(), android_abi(self.target.arch).into());
+                }
+                node.compiler = Some(self.target_compiler.clone());
+                self.target_base.clone()
+            }
+            NodeKind::HostTool => {
+                node.compiler = Some(if self.is_native() {
+                    self.target_compiler.clone()
+                } else {
+                    self.host_compiler.clone()
+                });
+                EffectiveConfig::default()
+            }
+        };
+        node.config = self.strategy.resolve_for_node(&node.name, dependents, &base);
+        let (cc, cxx, tf) = self.compilers_for(node);
+        node.toolchain_fingerprint = toolchain_fingerprint(cc, cxx, tf);
+    }
+}
+
+pub fn run(args: BuildArgs) -> Result<()> {
+    let host = TargetTriple::host();
+    let target: TargetTriple = match args.target {
+        Some(ref t) => t.parse()?,
+        None => host.clone(),
+    };
+    println!("Target triple: {target}");
+    println!("Host triple: {host}");
+
+    let project = Project::load(&args.manifest)?;
+    let m = &project.manifest;
+
+    let preset: Option<&Preset> = match args.preset.as_deref() {
+        Some(name) => Some(m.presets.get(name).with_context(|| {
+            let known: Vec<_> = m.presets.keys().map(String::as_str).collect();
+            format!("Unknown preset '{name}' (available: {})", known.join(", "))
+        })?),
+        None => None,
+    };
+
+    let mut options: BTreeMap<String, String> = BTreeMap::new();
+    for arg in &args.cmake_args {
+        match parse_define(arg) {
+            Some((k, v)) => {
+                options.insert(k, v);
+            }
+            None => warn(format!("ignoring --cmake-args value '{arg}' (expected -DKEY=VALUE)")),
+        }
+    }
+
+    let build_type = if let Some(ref bt) = args.build_type {
+        bt.parse::<BuildType>()?
+    } else if let Some(bt) = options.get("CMAKE_BUILD_TYPE") {
+        bt.parse::<BuildType>()?
+    } else if let Some(bt) = preset.and_then(|p| p.build_type) {
+        bt
+    } else {
+        BuildType::Release
+    };
+
+    let mut target_base = EffectiveConfig {
+        build_type,
+        ..Default::default()
+    };
+    if let Some(p) = preset {
+        if let Some(ref std) = p.cxx_std {
+            target_base.cxx_std = std.clone();
+        }
+        if let Some(sl) = p.cxx_stdlib {
+            target_base.cxx_stdlib = sl;
+        }
+        if let Some(ref lto) = p.lto {
+            target_base.lto = lto.enabled()?;
+        }
+        target_base.add_flags(&p.flags);
+        if p.cxx_stdlib_package.is_some() {
+            warn("presets: cxx_stdlib_package is not supported yet and is ignored");
+        }
+    }
+    target_base.vc_runtime = if let Some(ref raw) = args.msvc_runtime {
+        resolve_msvc_runtime(raw, build_type).context("Invalid --msvc-runtime")?
+    } else if let Some(rt) = preset.and_then(|p| p.vc_runtime) {
+        rt
+    } else if build_type == BuildType::Debug {
+        VCRuntime::MultiThreadedDebugDLL
+    } else {
+        VCRuntime::MultiThreadedDLL
+    };
+
+    let target_cfg = project.target_config(&target);
+    let c_compiler = args.c_compiler.clone().or(target_cfg.c_compiler);
+    let cxx_compiler = args.cxx_compiler.clone().or(target_cfg.cxx_compiler);
+    let toolchain_file = args
+        .toolchain_file
+        .clone()
+        .or_else(|| options.get("CMAKE_TOOLCHAIN_FILE").map(PathBuf::from))
+        .or(target_cfg.toolchain_file);
+    if let Some(ref tf) = toolchain_file
+        && !tf.is_file()
+    {
+        anyhow::bail!("Toolchain file not found: {}", tf.display());
+    }
+
+    let target_compiler = if let Some(c) = args.compiler.as_deref().or(target_cfg.compiler.as_deref()) {
+        c.parse::<CompilerType>().unwrap_or_else(|never| match never {})
+    } else if let Some(ref cc) = c_compiler {
+        CompilerType::detect_from_path(cc)
+    } else if let Some(ref cxx) = cxx_compiler {
+        CompilerType::detect_from_path(cxx)
+    } else {
+        detect_default_compiler(&target)
+    };
+    println!("Compiler: {target_compiler}");
+
+    let forwarded: BTreeMap<String, String> = options
+        .iter()
+        .filter(|(k, _)| k.starts_with("ANDROID_") || k.starts_with("CMAKE_ANDROID_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    let mut graph = project.build_graph()?;
+    connect_graph(&mut graph, &target, &options)?;
+    let topo_order = graph.topological_order()?;
+
+    let storage = StorageManager::new(project.base_dir(args.base_dir.as_deref())).with_scratch_dir(project.scratch_dir());
+    storage.ensure_dirs()?;
+    println!("Storage: {}", storage.base_dir().display());
+    let _build_lock = FileLock::acquire(storage.global_build_lock_path())?;
+
+    let ctx = BuildContext {
+        project: &project,
+        host_compiler: detect_default_compiler(&host),
+        target,
+        host,
+        strategy: StrategyEngine::new(&m.strategy),
+        storage,
+        c_compiler,
+        cxx_compiler,
+        toolchain_file,
+        target_compiler,
+        target_base,
+        default_shared: args.default_shared,
+        forwarded,
+    };
+
+    let mut built_nodes: Vec<DependencyNode> = Vec::new();
+    for idx in topo_order {
+        let node = build_node(&ctx, &graph, idx)?;
+        graph.graph[idx] = node.clone();
+        built_nodes.push(node);
+    }
+
+    let refs: Vec<&DependencyNode> = built_nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::TargetDependency)
+        .collect();
+    let cmake_content = CMakeGenerator::generate_targets_cmake(&refs);
+    let cmake_path = match args.generate_targets {
+        Some(out_file) => {
+            if let Some(parent) = out_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            out_file
+        }
+        None => ctx.storage.installed_dir().join("unideps.cmake"),
+    };
+    std::fs::write(&cmake_path, cmake_content)?;
+
+    println!("UniDeps successfully prepared environment: {}", cmake_path.display());
+    Ok(())
+}
+
+fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex) -> Result<DependencyNode> {
+    let deps = graph.reachable(idx, Direction::Outgoing);
+    let dependents: Vec<&str> = graph
+        .reachable(idx, Direction::Incoming)
+        .into_iter()
+        .map(|i| graph.graph[i].name.as_str())
+        .collect();
+
+    let mut node = graph.graph[idx].clone();
+    check_files(&node)?;
+    ctx.configure_node(&mut node, &dependents);
+
+    if node.kind == NodeKind::HostTool
+        && let Some(local) = ctx.project.local_tool_path(&node.name)
+    {
+        if !local.exists() {
+            anyhow::bail!("Local tool path for '{}' does not exist: {}", node.name, local.display());
+        }
+        println!("[LOCAL] {} ({})", node.name, local.display());
+        node.build_id = Some(HashCalculator::short_hash(&local.to_string_lossy()));
+        node.install_prefix = Some(local);
+        return Ok(node);
+    }
+
+    let sources = Sources { storage: &ctx.storage };
+    sources.resolve_floating_ref(&mut node)?;
+
+    let source_id = HashCalculator::calculate_source_id(&node);
+    node.source_id = Some(source_id.clone());
+
+    let dep_build_ids: Vec<&str> = deps.iter().filter_map(|&d| graph.graph[d].build_id.as_deref()).collect();
+    let build_id = HashCalculator::calculate_build_id(&node, &ctx.target, &ctx.host, &dep_build_ids);
+    node.build_id = Some(build_id.clone());
+
+    let dir_name = format!("{}-{build_id}", node.name);
+    let install_dir = ctx.storage.installed_dir().join(&dir_name);
+    node.install_prefix = Some(install_dir.clone());
+    let archive_name = format!("{dir_name}.tar.zst");
+    let cached_archive = ctx.storage.cache_dir().join(&archive_name);
+
+    if StorageManager::is_installed(&install_dir) {
+        println!("[CACHE HIT] {} ({build_id})", node.name);
+        return Ok(node);
+    }
+
+    GitSource::remove_dir_all_force(&install_dir)?;
+
+    if cached_archive.exists() {
+        println!("[UNPACK] {} ({build_id}) from cache: {archive_name}", node.name);
+        match Packager::unpack_zst_to_dir(&cached_archive, &install_dir) {
+            Ok(()) => {
+                StorageManager::mark_installed(&install_dir)?;
+                return Ok(node);
+            }
+            Err(e) => {
+                warn(format!("discarding corrupted cache archive {}: {e:#}", cached_archive.display()));
+                let _ = std::fs::remove_file(&cached_archive);
+                GitSource::remove_dir_all_force(&install_dir)?;
+            }
+        }
+    }
+
+    println!("[BUILD] {} ({build_id})", node.name);
+    let src_dir = sources.prepared_source(&node, &source_id)?;
+    let build_scratch = ctx.storage.scratch_dir().join(&dir_name);
+
+    if node.header_only {
+        install_headers(&node, &src_dir, &install_dir)?;
+    } else {
+        if !src_dir.join("CMakeLists.txt").exists() {
+            anyhow::bail!(
+                "CMakeLists.txt not found in source directory of '{}': {}",
+                node.name,
+                src_dir.display()
+            );
+        }
+        run_cmake(ctx, graph, &deps, &node, &src_dir, &build_scratch.join("build"), &install_dir)?;
+    }
+
+    Packager::pack_dir_to_zst(&install_dir, &cached_archive)?;
+    StorageManager::mark_installed(&install_dir)?;
+
+    if !ctx.project.keep_build_dirs() {
+        let _ = GitSource::remove_dir_all_force(&build_scratch);
+    }
+    Ok(node)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cmake(
+    ctx: &BuildContext,
+    graph: &DependencyGraph,
+    deps: &BTreeSet<NodeIndex>,
+    node: &DependencyNode,
+    src_dir: &Path,
+    bld_dir: &Path,
+    install_dir: &Path,
+) -> Result<()> {
+    let dep_nodes: Vec<&DependencyNode> = deps.iter().map(|&d| &graph.graph[d]).collect();
+
+    let dep_prefixes: Vec<PathBuf> = dep_nodes
+        .iter()
+        .filter(|d| d.kind == NodeKind::TargetDependency)
+        .filter_map(|d| d.install_prefix.clone())
+        .collect();
+
+    let mut host_tools_bins: Vec<PathBuf> = Vec::new();
+    for d in dep_nodes.iter().filter(|d| d.kind == NodeKind::HostTool) {
+        if let Some(ref p) = d.install_prefix {
+            let bin_dir = p.join("bin");
+            if bin_dir.exists() {
+                host_tools_bins.push(bin_dir);
+            }
+            host_tools_bins.push(p.clone());
+        }
+    }
+
+    let mut definitions = node.cmake_options.clone();
+    for (k, v) in &node.config.cmake_options {
+        definitions.insert(k.clone(), v.clone());
+    }
+    for d in dep_nodes.iter().filter(|d| d.kind == NodeKind::TargetDependency) {
+        for (k, v) in dep_root_vars(d) {
+            definitions.entry(k).or_insert(v);
+        }
+    }
+
+    let triple = ctx.triple_for(node);
+    let msvc_runtime = (triple.env == Environment::Msvc).then(|| node.config.vc_runtime.as_cmake_value());
+    let (c_compiler, cxx_compiler, toolchain_file) = ctx.compilers_for(node);
+    let build_type = node.config.build_type.to_string();
+    let log_dir = ctx
+        .storage
+        .logs_dir()
+        .join(install_dir.file_name().unwrap_or_default());
+
+    CMakeRunner::build_and_install(&CMakeBuild {
+        source_dir: src_dir,
+        build_dir: bld_dir,
+        install_prefix: install_dir,
+        build_type: &build_type,
+        shared: node.shared.unwrap_or(node.config.shared),
+        msvc_runtime,
+        c_compiler,
+        cxx_compiler,
+        toolchain_file,
+        definitions: &definitions,
+        prefix_paths: &dep_prefixes,
+        host_tools_bins: &host_tools_bins,
+        log_dir: Some(&log_dir),
+        flags: &node.config.flags,
+        cxx_std: &node.config.cxx_std,
+        cxx_stdlib: node.config.cxx_stdlib,
+        lto: node.config.lto,
+        jobs: ctx.project.max_jobs(),
+        collect_pdbs: triple.os == Os::Windows,
+        isolate_env: node.kind == NodeKind::HostTool && !ctx.is_native(),
+    })
+    .with_context(|| format!("Failed to build '{}'", node.name))
+}
+
+/// Keeps the relative layout because the generator resolves `include_dirs` against
+/// the install prefix.
+fn install_headers(node: &DependencyNode, src_dir: &Path, install_dir: &Path) -> Result<()> {
+    let dirs = if node.include_dirs.is_empty() {
+        vec![PathBuf::from("include")]
+    } else {
+        node.include_dirs.clone()
+    };
+    std::fs::create_dir_all(install_dir)?;
+    for rel in dirs {
+        if rel.is_absolute() {
+            anyhow::bail!("include_dirs of header-only '{}' must be relative: {}", node.name, rel.display());
+        }
+        let from = src_dir.join(&rel);
+        if !from.is_dir() {
+            anyhow::bail!(
+                "Header-only '{}': '{}' not found in source; set `include_dirs` to the header directory",
+                node.name,
+                rel.display()
+            );
+        }
+        unideps_builder::patch::PatchApplier::copy_dir_recursive(&from, &install_dir.join(&rel))?;
+    }
+    Ok(())
+}
+
+/// `<Name>_ROOT`, `<Name>_INCLUDE_DIR(S)` and `<Name>_LIBRARY/LIBRARIES` hints so that
+/// classic Find modules of dependent packages locate this dependency.
+fn dep_root_vars(dep: &DependencyNode) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    let Some(ref prefix) = dep.install_prefix else { return vars };
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/");
+
+    let mut names = vec![dep.name.clone(), dep.name.to_uppercase()];
+    if let Some(ref imp) = dep.import_name {
+        names.push(imp.clone());
+        names.push(imp.to_uppercase());
+    }
+    names.dedup();
+
+    let prefix_str = norm(prefix);
+    let inc_dir = prefix.join("include");
+    let inc_str = inc_dir.exists().then(|| norm(&inc_dir));
+
+    let mut found_lib = dep
+        .libraries
+        .iter()
+        .find_map(|lib| CMakeGenerator::resolve_library_path(prefix, lib))
+        .map(|p| norm(&p));
+    if found_lib.is_none()
+        && let Ok(entries) = std::fs::read_dir(prefix.join("lib"))
+    {
+        let is_lib = |f: &str| f.ends_with(".a") || f.ends_with(".lib") || f.ends_with(".so") || f.ends_with(".dylib");
+        let mut candidates: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_some_and(|f| is_lib(&f.to_string_lossy().to_lowercase())))
+            .collect();
+        candidates.sort();
+        let wanted: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+        let by_name = candidates.iter().find(|p| {
+            let f = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            wanted.iter().any(|w| f.contains(w.trim_start_matches("lib")))
+        });
+        found_lib = by_name.or(candidates.first()).map(|p| norm(p));
+    }
+
+    for n in &names {
+        vars.push((format!("{n}_ROOT"), prefix_str.clone()));
+        if let Some(ref inc) = inc_str {
+            vars.push((format!("{n}_INCLUDE_DIR"), inc.clone()));
+            vars.push((format!("{n}_INCLUDE_DIRS"), inc.clone()));
+        }
+        if let Some(ref lib) = found_lib {
+            vars.push((format!("{n}_LIBRARY"), lib.clone()));
+            vars.push((format!("{n}_LIBRARIES"), lib.clone()));
+        }
+    }
+    vars
+}
+
+pub fn fetch(manifest: &Path, base_dir: Option<&Path>) -> Result<()> {
+    let project = Project::load(manifest)?;
+    let graph = project.build_graph()?;
+    let storage = StorageManager::new(project.base_dir(base_dir));
+    storage.ensure_dirs()?;
+    let _lock = FileLock::acquire(storage.global_build_lock_path())?;
+    let sources = Sources { storage: &storage };
+    for idx in graph.graph.node_indices() {
+        let mut node = graph.graph[idx].clone();
+        if node.git.is_none() || node.path.is_some() || project.local_tool_path(&node.name).is_some() {
+            continue;
+        }
+        sources.resolve_floating_ref(&mut node)?;
+        let dir = sources.base_source(&node)?;
+        println!("[SOURCE] {} -> {}", node.name, dir.display());
+    }
+    println!("All sources fetched");
+    Ok(())
+}

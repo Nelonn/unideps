@@ -1,0 +1,270 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88 --profile minimal
+
+      - name: Check
+        run: cargo +1.88 check --workspace --all-targets --locked
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: [check, msrv]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-unknown-linux-gnu
+            linker: gcc
+            cc: gcc
+            ar: ar
+            artifact: unideps-linux-x64
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+            cc: aarch64-linux-gnu-gcc
+            ar: aarch64-linux-gnu-ar
+            artifact: unideps-linux-arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build binaries in Debian 11
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            -e TARGET="${{ matrix.target }}" \
+            -e LINKER="${{ matrix.linker }}" \
+            -e CC_FOR_TARGET="${{ matrix.cc }}" \
+            -e AR_FOR_TARGET="${{ matrix.ar }}" \
+            -e ARTIFACT="${{ matrix.artifact }}" \
+            debian:11 \
+            bash -lc '
+              set -euo pipefail
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                ca-certificates \
+                curl \
+                build-essential \
+                gcc-aarch64-linux-gnu \
+                libc6-dev-arm64-cross \
+                pkg-config
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              . "$HOME/.cargo/env"
+              rustup target add "$TARGET"
+              case "$TARGET" in
+                x86_64-unknown-linux-gnu)
+                  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$LINKER"
+                  export CC_x86_64_unknown_linux_gnu="$CC_FOR_TARGET"
+                  export AR_x86_64_unknown_linux_gnu="$AR_FOR_TARGET"
+                  ;;
+                aarch64-unknown-linux-gnu)
+                  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$LINKER"
+                  export CC_aarch64_unknown_linux_gnu="$CC_FOR_TARGET"
+                  export AR_aarch64_unknown_linux_gnu="$AR_FOR_TARGET"
+                  ;;
+              esac
+              cargo build --release --locked --target "$TARGET" -p unideps-cli
+              mkdir -p "dist/$ARTIFACT"
+              cp "target/$TARGET/release/unideps" "dist/$ARTIFACT/"
+              chmod +x "dist/$ARTIFACT/unideps"
+              tar -C dist -czf "$ARTIFACT.tar.gz" "$ARTIFACT"
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: [check, msrv]
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            msvc_arch: x64
+            artifact: unideps-windows-x64
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            msvc_arch: x64_arm64
+            artifact: unideps-windows-arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC
+        uses: TheMrMilchmann/setup-msvc-dev@v3
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Install Rust target
+        shell: pwsh
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build binary
+        shell: pwsh
+        run: cargo build --release --locked --target ${{ matrix.target }} -p unideps-cli
+
+      - name: Package binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "dist/${{ matrix.artifact }}" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/unideps.exe" "dist/${{ matrix.artifact }}/"
+          Compress-Archive -Path "dist/${{ matrix.artifact }}/*" -DestinationPath "${{ matrix.artifact }}.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: [check, msrv]
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-apple-darwin
+            artifact: unideps-macos-x64
+          - arch: arm64
+            target: aarch64-apple-darwin
+            artifact: unideps-macos-arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p unideps-cli
+
+      - name: Package binary
+        env:
+          COPYFILE_DISABLE: 1
+        run: |
+          mkdir -p "dist/${{ matrix.artifact }}"
+          cp "target/${{ matrix.target }}/release/unideps" "dist/${{ matrix.artifact }}/"
+          chmod +x "dist/${{ matrix.artifact }}/unideps"
+          (cd dist && zip -r "../${{ matrix.artifact }}.zip" "${{ matrix.artifact }}")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Release Assets
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - linux
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS
+
+      - name: Publish nightly pre-release
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete nightly --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create nightly release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Nightly" \
+            --notes "Automated nightly build from $GITHUB_SHA" \
+            --prerelease
+
+      - name: Publish tag release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "UniDeps release $GITHUB_REF_NAME"
+          fi

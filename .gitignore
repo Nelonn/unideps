@@ -1,0 +1,11 @@
+/target
+/dist
+
+# Local UniDeps state and machine-specific settings
+.unideps/
+.local.toml
+
+# Editor / language-server caches
+.cache/
+.idea/
+.vscode/

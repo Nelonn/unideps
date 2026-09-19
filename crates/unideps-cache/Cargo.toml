@@ -1,0 +1,17 @@
+[package]
+name = "unideps-cache"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+tar = { workspace = true }
+zstd = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

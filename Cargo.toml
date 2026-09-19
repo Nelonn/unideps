@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/unideps-core",
+    "crates/unideps-recipe",
+    "crates/unideps-builder",
+    "crates/unideps-cache",
+    "crates/unideps-cmake",
+    "crates/unideps-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Nelonn"]
+license = "MIT"
+rust-version = "1.88"
+description = "Deterministic C/C++ dependency orchestrator with native CMake integration"
+readme = "README.md"
+
+[workspace.dependencies]
+unideps-core = { path = "crates/unideps-core", version = "0.1.0" }
+unideps-recipe = { path = "crates/unideps-recipe", version = "0.1.0" }
+unideps-builder = { path = "crates/unideps-builder", version = "0.1.0" }
+unideps-cache = { path = "crates/unideps-cache", version = "0.1.0" }
+unideps-cmake = { path = "crates/unideps-cmake", version = "0.1.0" }
+
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+blake3 = "1.5"
+thiserror = "2.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
+zstd = "0.13"
+tar = "0.4"
+tempfile = "3.17"
+petgraph = "0.7"
+walkdir = "2.5"
+which = "7.0"
+dunce = "1.0"
+fs4 = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
