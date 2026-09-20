@@ -85,7 +85,7 @@ Version-only specs (`fmt = "10.2.1"`) require registries, which are not supporte
 | `strategy` | String | Build strategy. Only `"cmake-install"` (default) is supported |
 | `shared` | Boolean | Build shared (`true`) or static (`false`). Unset: `BUILD_SHARED_LIBS` of the consuming project, else static |
 | `header_only` | Boolean | Skip compilation and copy `include_dirs` (default `include/`) from the source into the install prefix |
-| `cmake_options` | Table | Definitions passed as `-D<KEY>=<VALUE>`. `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS` are merged with `flags` |
+| `cmake_options` | Table | Definitions passed as `-D<KEY>=<VALUE>`. `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS` are merged with `flags`. Values may refer to variables of the consuming CMake project, see [Variables in `cmake_options`](#variables-in-cmake_options) |
 | `patches` | Array of paths | Patches (`-p1` unified diffs) applied with `git apply`, falling back to `patch` |
 | `platforms` | Array of strings | Only build for matching targets. Values: `windows`, `linux`, `macos`/`darwin`, `ios`, `android`, `emscripten`, `x86_64`, `x86`, `arm`, `aarch64`/`arm64`, `wasm32`, `riscv64`, `msvc`, `gnu`, `musl`, or a full triple. Prefix `!` to exclude |
 | `enabled_if` | String | Condition over CMake variables of the consuming project, e.g. `"WITH_PNG"`, `"!NO_ZLIB"`, `"BACKEND=vulkan"`, `"A && !B"`, `"A \|\| B"` |
@@ -324,6 +324,27 @@ The `unideps` executable is looked up on `PATH` and next to the module (`../targ
 - cache options (`option()`, `-D`) and boolean variables, for `enabled_if`.
 
 Editing `unideps.toml` re-runs CMake configure automatically.
+
+### Variables in `cmake_options`
+
+`${NAME}` in a `cmake_options` value (of a dependency, an override, a `[[strategy]]` rule or a recipe) is replaced by the value of the CMake variable `NAME` of the project that calls `unideps_setup()`; `$ENV{NAME}` by an environment variable:
+
+```toml
+[dependencies.openmedia]
+git = "https://github.com/Nelonn/OpenMedia"
+cmake_options = { MY_SDK = "${MY_SDK}", MY_SDK_INCLUDE = "${MY_SDK}/include" }
+```
+
+```cmake
+set(MY_SDK "${CMAKE_CURRENT_SOURCE_DIR}/mysdk" CACHE PATH "") # before unideps_setup()
+unideps_setup()
+```
+
+- `unideps_setup()` passes on every variable that the manifest refers to this way, whatever its type (paths included); the variable has to be defined before the call. Outside CMake use `--cmake-args=-DMY_SDK=...`.
+- An undefined variable is an error, not an empty string.
+- The expanded value is what the dependency is built with, so it is part of the build id: another `MY_SDK` means another build.
+- Only the root manifest is scanned for references. In the `unideps.toml` of a dependency `${NAME}` can use variables that the root manifest refers to as well, or `$ENV{NAME}`.
+- The option reaches the dependency the entry is written for. It is not passed on to that dependency's own nested dependencies.
 
 ### Nested manifests
 

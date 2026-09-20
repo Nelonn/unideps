@@ -1,6 +1,6 @@
 use crate::project::{Project, check_files, connect_graph};
 use crate::source::Sources;
-use crate::util::{parse_bool, parse_define, resolve_msvc_runtime, toolchain_fingerprint, warn};
+use crate::util::{expand_vars, parse_bool, parse_define, resolve_msvc_runtime, toolchain_fingerprint, warn};
 use anyhow::{Context, Result};
 use clap::Args;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -103,6 +103,8 @@ struct BuildContext<'a> {
     target_base: EffectiveConfig,
     default_shared: Option<bool>,
     forwarded: BTreeMap<String, String>,
+    /// Variables of the consuming CMake project (`--cmake-args`), for `${NAME}` in `cmake_options`.
+    vars: BTreeMap<String, String>,
 }
 
 /// Names of the packages whose nested `unideps.toml` is being built, outermost first,
@@ -133,6 +135,7 @@ impl<'a> BuildContext<'a> {
             target_base: self.target_base.clone(),
             default_shared: self.default_shared,
             forwarded: self.forwarded.clone(),
+            vars: self.vars.clone(),
         }
     }
 
@@ -161,7 +164,7 @@ impl<'a> BuildContext<'a> {
         }
     }
 
-    fn configure_node(&self, node: &mut DependencyNode, dependents: &[&str]) {
+    fn configure_node(&self, node: &mut DependencyNode, dependents: &[&str]) -> Result<()> {
         let base = match node.kind {
             NodeKind::TargetDependency => {
                 if node.shared.is_none() {
@@ -190,6 +193,16 @@ impl<'a> BuildContext<'a> {
         node.config = self.strategy.resolve_for_node(&node.name, dependents, &base);
         let (cc, cxx, tf) = self.compilers_for(node);
         node.toolchain_fingerprint = toolchain_fingerprint(cc, cxx, tf);
+
+        // After the rules are applied and before anything is hashed: the expanded values
+        // are what the package is built with.
+        for options in [&mut node.cmake_options, &mut node.config.cmake_options] {
+            for (key, value) in options.iter_mut() {
+                *value = expand_vars(value, &self.vars)
+                    .with_context(|| format!("In cmake_options.{key} of '{}'", node.name))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -317,6 +330,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         target_base,
         default_shared: args.default_shared,
         forwarded,
+        vars: options,
     };
 
     let built_nodes = build_project(&ctx, &mut graph, &mut NestedStack::new())?;
@@ -467,7 +481,7 @@ fn probe_options(
         if !out.is_file() {
             let log = ctx.storage.logs_dir().join(&name).join("configure.log");
             warn(format!(
-                "could not read the options of '{}', so its optional dependencies (`enabled_if`) are treated as disabled.                  Does its cmake/unideps.cmake support nested builds (update it) and does the configure reach                  unideps_setup()? Log: {}",
+                "could not read the options of '{}', so its optional dependencies (`enabled_if`) are treated as disabled. Does its cmake/unideps.cmake support nested builds (update it) and does the configure reach unideps_setup()? Log: {}",
                 node.name,
                 log.display()
             ));
@@ -497,7 +511,7 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
 
     let mut node = graph.graph[idx].clone();
     check_files(&node)?;
-    ctx.configure_node(&mut node, &dependents);
+    ctx.configure_node(&mut node, &dependents)?;
 
     if node.kind == NodeKind::HostTool
         && let Some(local) = ctx.project.local_tool_path(&node.name)

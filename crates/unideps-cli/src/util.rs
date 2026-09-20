@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use unideps_core::target::{BuildType, VCRuntime};
 
@@ -37,6 +38,44 @@ pub fn resolve_msvc_runtime(raw: &str, build_type: BuildType) -> Result<VCRuntim
         anyhow::bail!("Unsupported generator expression in MSVC runtime '{raw}'");
     }
     Ok(out.parse::<VCRuntime>()?)
+}
+
+/// Expands `${NAME}` (a variable of the consuming CMake project, given as
+/// `--cmake-args=-DNAME=...`) and `$ENV{NAME}` in a `cmake_options` value. Anything else,
+/// including a `$` not followed by `{`, is kept as is. Unknown names are errors: passing
+/// the literal text on to CMake would silently configure the package wrongly.
+pub fn expand_vars(value: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(pos) = rest.find('$') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        let (from_env, body) = match tail.strip_prefix("$ENV{") {
+            Some(b) => (true, b),
+            None => match tail.strip_prefix("${") {
+                Some(b) => (false, b),
+                None => {
+                    out.push('$');
+                    rest = &tail[1..];
+                    continue;
+                }
+            },
+        };
+        let Some((name, after)) = body.split_once('}') else {
+            anyhow::bail!("Unterminated variable reference in '{value}'");
+        };
+        let resolved = if from_env { std::env::var(name).ok() } else { vars.get(name).cloned() };
+        match resolved {
+            Some(v) => out.push_str(&v),
+            None if from_env => anyhow::bail!("Environment variable '{name}' (used in '{value}') is not set"),
+            None => anyhow::bail!(
+                "Variable '{name}' (used in '{value}') is not defined: set it in CMake before unideps_setup() or pass --cmake-args=-D{name}=<value>"
+            ),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 pub fn resolve_relative(base: &Path, p: &Path) -> PathBuf {
@@ -135,6 +174,24 @@ mod tests {
         assert_eq!(parse_define("-DFOO:BOOL=OFF"), Some(("FOO".into(), "OFF".into())));
         assert_eq!(parse_define("-DPATH=a=b"), Some(("PATH".into(), "a=b".into())));
         assert_eq!(parse_define("--foo"), None);
+    }
+
+    #[test]
+    fn variables_are_expanded() {
+        let vars = BTreeMap::from([("SKIA_DIR".to_string(), "C:/skia".to_string())]);
+        assert_eq!(expand_vars("${SKIA_DIR}", &vars).unwrap(), "C:/skia");
+        assert_eq!(expand_vars("-I${SKIA_DIR}/include;${SKIA_DIR}", &vars).unwrap(), "-IC:/skia/include;C:/skia");
+        assert_eq!(expand_vars("plain $ and $x and 5$", &vars).unwrap(), "plain $ and $x and 5$");
+        assert_eq!(expand_vars("", &vars).unwrap(), "");
+    }
+
+    #[test]
+    fn unknown_or_broken_variables_are_errors() {
+        let vars = BTreeMap::new();
+        let err = expand_vars("${SKIA_DIR}", &vars).unwrap_err().to_string();
+        assert!(err.contains("SKIA_DIR") && err.contains("--cmake-args"), "{err}");
+        assert!(expand_vars("$ENV{UNIDEPS_SURELY_UNSET_VARIABLE}", &vars).is_err());
+        assert!(expand_vars("${SKIA_DIR", &vars).is_err());
     }
 
     #[test]

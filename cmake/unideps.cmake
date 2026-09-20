@@ -226,6 +226,25 @@ macro(_unideps_setup_build)
         list(APPEND _unideps_cmd "--cmake-args=-D${_unideps_def}")
     endforeach()
 
+    # Variables the manifest refers to as ${NAME} (in `cmake_options` values), whatever their
+    # type: paths such as SKIA_DIR are not picked up by the scan above.
+    if(EXISTS "${_UNIDEPS_MANIFEST}")
+        file(READ "${_UNIDEPS_MANIFEST}" _unideps_manifest_text)
+        string(REGEX MATCHALL "\\$\\{[A-Za-z0-9_.+-]+\\}" _unideps_refs "${_unideps_manifest_text}")
+        list(REMOVE_DUPLICATES _unideps_refs)
+        foreach(_unideps_ref IN LISTS _unideps_refs)
+            string(REGEX REPLACE "^\\$\\{(.*)\\}$" "\\1" _unideps_name "${_unideps_ref}")
+            if(NOT DEFINED ${_unideps_name})
+                continue()
+            endif()
+            if("${${_unideps_name}}" MATCHES ";")
+                message(WARNING "UniDeps: ${_unideps_name} is a list and cannot be passed to unideps as ${_unideps_ref}")
+                continue()
+            endif()
+            list(APPEND _unideps_cmd "--cmake-args=-D${_unideps_name}=${${_unideps_name}}")
+        endforeach()
+    endif()
+
     execute_process(
         COMMAND ${_unideps_cmd}
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
