@@ -24,7 +24,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         shell: bash
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust 1.88
         run: rustup toolchain install 1.88 --profile minimal
@@ -74,7 +74,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build binaries in Debian 11
         shell: bash
@@ -90,7 +90,9 @@ jobs:
             debian:11 \
             bash -lc '
               set -euo pipefail
-              sed -i -e "s|deb.debian.org|archive.debian.org|g" -e "/bullseye-updates/d" /etc/apt/sources.list
+              SNAPSHOT=20260830T000000Z
+              echo "deb http://snapshot.debian.org/archive/debian/$SNAPSHOT bullseye main" > /etc/apt/sources.list
+              echo "deb http://snapshot.debian.org/archive/debian-security/$SNAPSHOT bullseye-security main" >> /etc/apt/sources.list
               apt-get -o Acquire::Check-Valid-Until=false update
               apt-get install -y --no-install-recommends \
                 ca-certificates \
@@ -147,7 +149,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure MSVC
         uses: TheMrMilchmann/setup-msvc-dev@v3
@@ -193,7 +195,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
