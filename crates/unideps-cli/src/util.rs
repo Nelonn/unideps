@@ -64,6 +64,17 @@ pub fn expand_vars(value: &str, vars: &BTreeMap<String, String>) -> Result<Strin
         let Some((name, after)) = body.split_once('}') else {
             anyhow::bail!("Unterminated variable reference in '{value}'");
         };
+        // `${dependency.prefix}` needs the installed dependency, see `expand_dep_refs`.
+        if !from_env && dep_ref(name).is_some() {
+            out.push_str("${");
+            out.push_str(name);
+            out.push('}');
+            rest = after;
+            continue;
+        }
+        if !from_env && name.ends_with(".path") {
+            anyhow::bail!("'${{{name}}}' in '{value}': use ${{{}.prefix}} for the install prefix of a dependency", &name[..name.len() - 5]);
+        }
         let resolved = if from_env { std::env::var(name).ok() } else { vars.get(name).cloned() };
         match resolved {
             Some(v) => out.push_str(&v),
@@ -71,6 +82,44 @@ pub fn expand_vars(value: &str, vars: &BTreeMap<String, String>) -> Result<Strin
             None => anyhow::bail!(
                 "Variable '{name}' (used in '{value}') is not defined: set it in CMake before unideps_setup() or pass --cmake-args=-D{name}=<value>"
             ),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// `${dependency.prefix}`: the dependency part of the name.
+fn dep_ref(name: &str) -> Option<&str> {
+    let (dep, field) = name.rsplit_once('.')?;
+    (!dep.is_empty() && field == "prefix").then_some(dep)
+}
+
+/// Replaces `${dependency.prefix}` in a `cmake_options` value by
+/// the install prefix returned by `prefix_of`. This happens only when CMake is started:
+/// the prefix depends on the storage location, so it must not be part of the build id
+/// (the build id of the dependency already is).
+pub fn expand_dep_refs(value: &str, prefix_of: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(pos) = rest.find("${") {
+        out.push_str(&rest[..pos]);
+        let body = &rest[pos + 2..];
+        let Some((name, after)) = body.split_once('}') else {
+            anyhow::bail!("Unterminated variable reference in '{value}'");
+        };
+        match dep_ref(name) {
+            Some(dep) => match prefix_of(dep) {
+                Some(prefix) => out.push_str(&prefix),
+                None => anyhow::bail!(
+                    "'${{{name}}}' refers to '{dep}', which is not built before this package: add it to `dependencies` (or `tools`)"
+                ),
+            },
+            None => {
+                out.push_str("${");
+                out.push_str(name);
+                out.push('}');
+            }
         }
         rest = after;
     }
@@ -192,6 +241,28 @@ mod tests {
         assert!(err.contains("SKIA_DIR") && err.contains("--cmake-args"), "{err}");
         assert!(expand_vars("$ENV{UNIDEPS_SURELY_UNSET_VARIABLE}", &vars).is_err());
         assert!(expand_vars("${SKIA_DIR", &vars).is_err());
+    }
+
+    #[test]
+    fn dependency_references_survive_variable_expansion() {
+        let vars = BTreeMap::from([("A".to_string(), "x".to_string())]);
+        assert_eq!(expand_vars("${A}:${vulkan.prefix}/include", &vars).unwrap(), "x:${vulkan.prefix}/include");
+    }
+
+    #[test]
+    fn dependency_path_suggests_prefix() {
+        let err = expand_vars("${vulkan.path}", &BTreeMap::new()).unwrap_err().to_string();
+        assert!(err.contains("${vulkan.prefix}"), "{err}");
+    }
+
+    #[test]
+    fn dependency_references_are_expanded_to_prefixes() {
+        let prefix_of = |d: &str| (d == "vulkan").then(|| "C:/store/vulkan-1".to_string());
+        assert_eq!(expand_dep_refs("${vulkan.prefix}/include", &prefix_of).unwrap(), "C:/store/vulkan-1/include");
+        assert_eq!(expand_dep_refs("${vulkan.prefix};${vulkan.prefix}", &prefix_of).unwrap(), "C:/store/vulkan-1;C:/store/vulkan-1");
+        assert_eq!(expand_dep_refs("no refs", &prefix_of).unwrap(), "no refs");
+        let err = expand_dep_refs("${other.prefix}", &prefix_of).unwrap_err().to_string();
+        assert!(err.contains("other") && err.contains("dependencies"), "{err}");
     }
 
     #[test]

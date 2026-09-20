@@ -346,6 +346,19 @@ unideps_setup()
 - Only the root manifest is scanned for references. In the `unideps.toml` of a dependency `${NAME}` can use variables that the root manifest refers to as well, or `$ENV{NAME}`.
 - The option reaches the dependency the entry is written for. It is not passed on to that dependency's own nested dependencies.
 
+#### Other dependencies
+
+`${name.prefix}` is the install prefix of another dependency (or tool) that is built before this one, i.e. one listed in its `dependencies` / `tools`, or nested in it:
+
+```toml
+[dependencies.volk]
+git = "https://github.com/zeux/volk"
+cmake_options = { VULKAN_HEADERS_INSTALL_DIR = "${vulkanheaders.prefix}" }
+dependencies = ["vulkanheaders"]
+```
+
+The prefix depends on where the storage lives, so the build id contains the text `${vulkanheaders.prefix}` and the build id of `vulkanheaders`, not the path itself: the cache stays valid when the storage moves. Referring to a package that is not built before this one is an error.
+
 ### Nested manifests
 
 If the source of a dependency contains a `unideps.toml`, unideps builds the dependencies declared there first, in the same run and with the same target and compiler:

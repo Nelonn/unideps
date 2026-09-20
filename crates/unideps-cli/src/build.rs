@@ -1,6 +1,6 @@
 use crate::project::{Project, check_files, connect_graph};
 use crate::source::Sources;
-use crate::util::{expand_vars, parse_bool, parse_define, resolve_msvc_runtime, toolchain_fingerprint, warn};
+use crate::util::{expand_dep_refs, expand_vars, parse_bool, parse_define, resolve_msvc_runtime, toolchain_fingerprint, warn};
 use anyhow::{Context, Result};
 use clap::Args;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -196,11 +196,18 @@ impl<'a> BuildContext<'a> {
 
         // After the rules are applied and before anything is hashed: the expanded values
         // are what the package is built with.
+        // All problems of a package are reported together, not one per run.
+        let mut errors: Vec<String> = Vec::new();
         for options in [&mut node.cmake_options, &mut node.config.cmake_options] {
             for (key, value) in options.iter_mut() {
-                *value = expand_vars(value, &self.vars)
-                    .with_context(|| format!("In cmake_options.{key} of '{}'", node.name))?;
+                match expand_vars(value, &self.vars) {
+                    Ok(expanded) => *value = expanded,
+                    Err(e) => errors.push(format!("In cmake_options.{key} of '{}': {e:#}", node.name)),
+                }
             }
+        }
+        if !errors.is_empty() {
+            anyhow::bail!("{}", errors.join("\n"));
         }
         Ok(())
     }
@@ -312,9 +319,6 @@ pub fn run(args: BuildArgs) -> Result<()> {
     graph.topological_order()?;
 
     let storage = StorageManager::new(project.base_dir(args.base_dir.as_deref())).with_scratch_dir(project.scratch_dir());
-    storage.ensure_dirs()?;
-    println!("Storage: {}", storage.base_dir().display());
-    let _build_lock = FileLock::acquire(storage.global_build_lock_path())?;
 
     let ctx = BuildContext {
         project: &project,
@@ -332,6 +336,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
         forwarded,
         vars: options,
     };
+
+    // Before the first (possibly long) build: report configuration errors of all packages.
+    preflight(&ctx, &graph)?;
+
+    storage.ensure_dirs()?;
+    println!("Storage: {}", storage.base_dir().display());
+    let _build_lock = FileLock::acquire(storage.global_build_lock_path())?;
 
     let built_nodes = build_project(&ctx, &mut graph, &mut NestedStack::new())?;
 
@@ -352,6 +363,28 @@ pub fn run(args: BuildArgs) -> Result<()> {
     std::fs::write(&cmake_path, cmake_content)?;
 
     println!("UniDeps successfully prepared environment: {}", cmake_path.display());
+    Ok(())
+}
+
+/// Configures every node without building it, so that mistakes in the manifest (an
+/// undefined `${NAME}` in `cmake_options`, ...) are reported before anything is built,
+/// all at once. Packages behind nested manifests are checked when they are reached.
+fn preflight(ctx: &BuildContext, graph: &DependencyGraph) -> Result<()> {
+    let mut errors: Vec<String> = Vec::new();
+    for idx in graph.graph.node_indices() {
+        let mut node = graph.graph[idx].clone();
+        let dependents: Vec<&str> = graph
+            .reachable(idx, Direction::Incoming)
+            .into_iter()
+            .map(|i| graph.graph[i].name.as_str())
+            .collect();
+        if let Err(e) = ctx.configure_node(&mut node, &dependents) {
+            errors.push(format!("{e:#}"));
+        }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("{}", errors.join("\n"));
+    }
     Ok(())
 }
 
@@ -438,6 +471,7 @@ fn build_nested(
     connect_graph(&mut graph, &ctx.target, &options)?;
 
     let nested_ctx = ctx.with_strategy(StrategyEngine::new(&project.manifest.strategy));
+    preflight(&nested_ctx, &graph).with_context(|| format!("In the nested unideps.toml of '{}'", node.name))?;
     stack.push((node.name.clone(), source_id.to_string()));
     let built = build_project(&nested_ctx, &mut graph, stack);
     stack.pop();
@@ -659,6 +693,14 @@ fn run_cmake(
     let mut definitions = node.cmake_options.clone();
     for (k, v) in &node.config.cmake_options {
         definitions.insert(k.clone(), v.clone());
+    }
+    let prefix_of = |name: &str| {
+        let dep = dep_nodes.iter().find(|d| d.name == name)?;
+        Some(dep.install_prefix.as_ref()?.to_string_lossy().replace('\\', "/"))
+    };
+    for (key, value) in definitions.iter_mut() {
+        *value = expand_dep_refs(value, &prefix_of)
+            .with_context(|| format!("In cmake_options.{key} of '{}'", node.name))?;
     }
     for d in dep_nodes.iter().filter(|d| d.kind == NodeKind::TargetDependency) {
         for (k, v) in dep_root_vars(d) {
