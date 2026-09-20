@@ -6,6 +6,13 @@ use unideps_core::target::CxxStdlib;
 
 pub struct CMakeRunner;
 
+struct Configured {
+    bld: PathBuf,
+    pfx: PathBuf,
+    path_env: Option<std::ffi::OsString>,
+    log_destination: PathBuf,
+}
+
 pub struct CMakeBuild<'a> {
     pub source_dir: &'a Path,
     pub build_dir: &'a Path,
@@ -31,6 +38,11 @@ pub struct CMakeBuild<'a> {
     /// Used for host tools so they are built with the host's default compiler.
     pub isolate_env: bool,
 }
+
+/// Exported to every CMake process started by unideps. A nested `unideps` invocation
+/// would block forever on the build lock held by the outer one, so the CLI refuses to
+/// start when it is set and `unideps_setup()` uses the pre-generated targets instead.
+pub const ACTIVE_ENV_VAR: &str = "UNIDEPS_ACTIVE";
 
 pub const TOOLCHAIN_ENV_VARS: &[&str] = &[
     "CC", "CXX", "CPP", "AS", "AR", "LD", "RC", "ASM", "OBJC", "OBJCXX", "CUDACXX",
@@ -151,9 +163,50 @@ impl CMakeRunner {
         Ok(args)
     }
 
+    /// Runs only the configure step and returns the path of its log. A failing configure
+    /// is not an error here: probes stop on purpose after writing what the caller needs.
+    pub fn configure_only(b: &CMakeBuild) -> Result<PathBuf> {
+        let configured = Self::configure(b, false)?;
+        Ok(configured.log_destination.join("configure.log"))
+    }
+
     pub fn build_and_install(b: &CMakeBuild) -> Result<()> {
-        std::fs::create_dir_all(b.build_dir)?;
         std::fs::create_dir_all(b.install_prefix)?;
+        let Configured { bld, pfx, path_env, log_destination } = Self::configure(b, true)?;
+
+        let mut bld_cmd = Command::new("cmake");
+        bld_cmd.current_dir(&bld);
+        if b.isolate_env {
+            for var in TOOLCHAIN_ENV_VARS {
+                bld_cmd.env_remove(var);
+            }
+        }
+        bld_cmd.args(["--build", "."]);
+        bld_cmd.args(["--config", b.build_type]);
+        if let Some(jobs) = b.jobs {
+            bld_cmd.args(["--parallel", &jobs.to_string()]);
+        }
+        if let Some(ref p) = path_env {
+            bld_cmd.env("PATH", p);
+        }
+        Self::run_logged(bld_cmd, &log_destination.join("build.log"), "build")?;
+
+        let mut inst_cmd = Command::new("cmake");
+        inst_cmd.current_dir(&bld);
+        inst_cmd.args(["--install", "."]);
+        inst_cmd.args(["--config", b.build_type]);
+        let inst_log_path = log_destination.join("install.log");
+        Self::run_logged(inst_cmd, &inst_log_path, "install")?;
+
+        if b.collect_pdbs {
+            Self::auto_install_pdbs(&bld, &pfx, Some(&inst_log_path))?;
+        }
+
+        Ok(())
+    }
+
+    fn configure(b: &CMakeBuild, must_succeed: bool) -> Result<Configured> {
+        std::fs::create_dir_all(b.build_dir)?;
 
         let src = dunce::canonicalize(b.source_dir).unwrap_or_else(|_| b.source_dir.to_path_buf());
         let bld = dunce::canonicalize(b.build_dir).unwrap_or_else(|_| b.build_dir.to_path_buf());
@@ -201,41 +254,17 @@ impl CMakeRunner {
         let log_destination = b.log_dir.map(PathBuf::from).unwrap_or_else(|| bld.clone());
         std::fs::create_dir_all(&log_destination)?;
 
-        Self::run_logged(cfg, &log_destination.join("configure.log"), "configure")?;
-
-        let mut bld_cmd = Command::new("cmake");
-        bld_cmd.current_dir(&bld);
-        if b.isolate_env {
-            for var in TOOLCHAIN_ENV_VARS {
-                bld_cmd.env_remove(var);
-            }
-        }
-        bld_cmd.args(["--build", "."]);
-        bld_cmd.args(["--config", b.build_type]);
-        if let Some(jobs) = b.jobs {
-            bld_cmd.args(["--parallel", &jobs.to_string()]);
-        }
-        if let Some(ref p) = path_env {
-            bld_cmd.env("PATH", p);
-        }
-        Self::run_logged(bld_cmd, &log_destination.join("build.log"), "build")?;
-
-        let mut inst_cmd = Command::new("cmake");
-        inst_cmd.current_dir(&bld);
-        inst_cmd.args(["--install", "."]);
-        inst_cmd.args(["--config", b.build_type]);
-        let inst_log_path = log_destination.join("install.log");
-        Self::run_logged(inst_cmd, &inst_log_path, "install")?;
-
-        if b.collect_pdbs {
-            Self::auto_install_pdbs(&bld, &pfx, Some(&inst_log_path))?;
+        let result = Self::run_logged(cfg, &log_destination.join("configure.log"), "configure");
+        if must_succeed {
+            result?;
         }
 
-        Ok(())
+        Ok(Configured { bld, pfx, path_env, log_destination })
     }
 
     fn run_logged(mut cmd: Command, log_path: &Path, step: &str) -> Result<()> {
         cmd.env_remove("MAKEFLAGS");
+        cmd.env(ACTIVE_ENV_VAR, "1");
         let mut log = std::fs::File::create(log_path)?;
         std::io::Write::write_all(&mut log, format!("Command: {cmd:?}\n\n").as_bytes())?;
         let err = log.try_clone()?;

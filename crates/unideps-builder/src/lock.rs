@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -26,7 +26,7 @@ impl FileLock {
             .open(&p)
             .with_context(|| format!("Failed to open lock file: {}", p.display()))?;
 
-        FileExt::lock_exclusive(&file)
+        FileExt::lock(&file)
             .with_context(|| format!("Failed to acquire exclusive lock on: {}", p.display()))?;
 
         Ok(Self {

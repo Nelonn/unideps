@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use unideps_builder::git::GitSource;
 use unideps_builder::lock::FileLock;
+use unideps_builder::runners::cmake::ACTIVE_ENV_VAR;
 use unideps_builder::storage::StorageManager;
 
 #[derive(Parser, Debug)]
@@ -44,7 +45,15 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    if std::env::var_os(ACTIVE_ENV_VAR).is_some_and(|v| !v.is_empty()) {
+        anyhow::bail!(
+            "unideps was started from inside another unideps run ({ACTIVE_ENV_VAR} is set); it would wait forever \
+             for the build lock. Nested unideps.toml files are built by the outer run: in the dependency's \
+             CMakeLists.txt use `unideps_setup()` from cmake/unideps.cmake instead of calling `unideps` directly"
+        );
+    }
+    match cli.command {
         Commands::Build(args) => build::run(*args),
         Commands::Fetch { manifest, base_dir } => build::fetch(&manifest, base_dir.as_deref()),
         Commands::Clean { manifest, base_dir } => {

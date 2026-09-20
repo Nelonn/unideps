@@ -90,7 +90,8 @@ jobs:
             debian:11 \
             bash -lc '
               set -euo pipefail
-              apt-get update
+              sed -i -e "s|deb.debian.org|archive.debian.org|g" -e "/bullseye-updates/d" /etc/apt/sources.list
+              apt-get -o Acquire::Check-Valid-Until=false update
               apt-get install -y --no-install-recommends \
                 ca-certificates \
                 curl \

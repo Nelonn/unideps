@@ -325,6 +325,24 @@ The `unideps` executable is looked up on `PATH` and next to the module (`../targ
 
 Editing `unideps.toml` re-runs CMake configure automatically.
 
+### Nested manifests
+
+If the source of a dependency contains a `unideps.toml`, unideps builds the dependencies declared there first, in the same run and with the same target and compiler:
+
+- they end up in the root `unideps_targets.cmake`, so the project can link them directly. If the project declares a package with the same name itself, the project's build is used and a warning is printed; between nested manifests the first one wins;
+- their prefixes are added to `CMAKE_PREFIX_PATH` of the dependency's build and their build ids are part of the dependency's build id;
+- the dependency's own `unideps_setup()` does **not** start `unideps`: the outer run generates a targets file for the nested dependencies and passes it as `UNIDEPS_NESTED_TARGETS`, which `unideps_setup()` includes. `MANIFEST`, `TARGET_FILE` and the other parameters are ignored in this mode;
+- `[strategy]` rules of the nested manifest apply to its dependencies; `[presets]`, `[targets]`, `[overrides]` and `.local.toml` of the nested manifest are ignored, the outer ones are used for local tools and resource limits;
+- `enabled_if` in the nested manifest refers to the options of the dependency itself: its `option()` defaults, overridden by the dependency's `cmake_options` (the options of the outer project are not used). They are only known once its CMake has run, so unideps first configures the dependency once in a scratch directory (`[PROBE]`); its `unideps_setup()` writes the options declared before it and stops the configure. The result is cached, and the probe is skipped if no nested dependency uses `enabled_if`. Declare the options **before** `unideps_setup()`, and keep the dependency's `cmake/unideps.cmake` up to date: an older copy cannot be probed and all `enabled_if` dependencies are treated as disabled (with a warning);
+- cycles between nested manifests are reported as an error;
+- only target dependencies are inspected, `[tools]` are not. `unideps fetch` follows nested manifests too.
+
+The nested manifest is found in the (patched) source, so a dependency's source has to be present even when its build is cached; an existing checkout is reused without network access.
+
+### Nesting guard
+
+Every CMake process started by unideps has `UNIDEPS_ACTIVE=1` in its environment. A second `unideps` started from inside would wait forever for the build lock held by the first, so `unideps` refuses to run when the variable is set. `unideps_setup()` checks it too and switches to the nested mode above.
+
 ### Limitations
 
 - Multi-config generators (Visual Studio, Ninja Multi-Config): dependencies are built once, for `CMAKE_BUILD_TYPE` or Release. Pass `-DCMAKE_BUILD_TYPE=Debug` to get debug dependencies.

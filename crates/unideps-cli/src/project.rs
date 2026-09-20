@@ -19,6 +19,16 @@ pub struct Project {
 
 impl Project {
     pub fn load(manifest_path: &Path) -> Result<Self> {
+        Self::load_with(manifest_path, true)
+    }
+
+    /// Manifest of a dependency's source tree. Storage, tools and resource limits
+    /// belong to the outer project, so a `.local.toml` shipped in the source is ignored.
+    pub fn load_nested(manifest_path: &Path) -> Result<Self> {
+        Self::load_with(manifest_path, false)
+    }
+
+    fn load_with(manifest_path: &Path, read_local: bool) -> Result<Self> {
         if !manifest_path.exists() {
             anyhow::bail!("Manifest file not found: {}", manifest_path.display());
         }
@@ -26,7 +36,7 @@ impl Project {
         let manifest_dir = manifest_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
         let manifest = Manifest::from_file(&manifest_path)?;
         let local_path = manifest_dir.join(".local.toml");
-        let local = if local_path.exists() {
+        let local = if read_local && local_path.exists() {
             Some(LocalConfig::from_file(&local_path)?)
         } else {
             None
@@ -382,6 +392,16 @@ mod tests {
         std::fs::write(temp.path().join("unideps.toml"), "").unwrap();
         std::fs::write(temp.path().join(".local.toml"), "[storage\n").unwrap();
         assert!(Project::load(&temp.path().join("unideps.toml")).is_err());
+    }
+
+    #[test]
+    fn nested_manifest_ignores_local_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("unideps.toml"), "").unwrap();
+        std::fs::write(temp.path().join(".local.toml"), "[storage
+").unwrap();
+        let p = Project::load_nested(&temp.path().join("unideps.toml")).unwrap();
+        assert!(p.local.is_none());
     }
 
     #[test]
