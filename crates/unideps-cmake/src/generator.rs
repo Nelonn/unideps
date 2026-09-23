@@ -37,6 +37,54 @@ impl CMakeGenerator {
         }
         writeln!(&mut out).unwrap();
 
+        // Read by unideps_setup() to copy the runtime libraries next to the consumer's binaries.
+        writeln!(&mut out, "set(UNIDEPS_INSTALL_PREFIXES \"\")").unwrap();
+        for node in nodes {
+            if let Some(ref prefix) = node.install_prefix {
+                let norm = prefix.to_string_lossy().replace('\\', "/");
+                writeln!(&mut out, "list(APPEND UNIDEPS_INSTALL_PREFIXES \"{norm}\")").unwrap();
+            }
+        }
+        // find_package(CONFIG) caches the location it found in a <Pkg>_DIR PATH entry, and
+        // reuses it on the next configure as long as that directory still exists -- even when
+        // CMAKE_PREFIX_PATH / <Pkg>_ROOT now point somewhere else. A rebuilt dependency lands
+        // in a prefix with a different hash while the old one stays on disk, so the consumer
+        // would keep linking the previous build until `installed/` is wiped by hand. Drop every
+        // cache entry pointing into a unideps install root that is not one of this run's prefixes.
+        out.push_str(r#"set(_unideps_roots "")
+foreach(_unideps_p IN LISTS UNIDEPS_INSTALL_PREFIXES)
+    get_filename_component(_unideps_r "${_unideps_p}" DIRECTORY)
+    list(APPEND _unideps_roots "${_unideps_r}")
+endforeach()
+if(_unideps_roots)
+    list(REMOVE_DUPLICATES _unideps_roots)
+    get_cmake_property(_unideps_cache_vars CACHE_VARIABLES)
+    foreach(_unideps_v IN LISTS _unideps_cache_vars)
+        set(_unideps_stale FALSE)
+        foreach(_unideps_val IN LISTS ${_unideps_v})
+            string(REPLACE "\\" "/" _unideps_val "${_unideps_val}")
+            foreach(_unideps_r IN LISTS _unideps_roots)
+                string(FIND "${_unideps_val}" "${_unideps_r}/" _unideps_pos)
+                if(_unideps_pos EQUAL 0)
+                    set(_unideps_stale TRUE)
+                endif()
+            endforeach()
+            foreach(_unideps_p IN LISTS UNIDEPS_INSTALL_PREFIXES)
+                string(FIND "${_unideps_val}" "${_unideps_p}/" _unideps_pos)
+                if(_unideps_pos EQUAL 0)
+                    set(_unideps_stale FALSE)
+                endif()
+            endforeach()
+        endforeach()
+        if(_unideps_stale)
+            message(STATUS "UniDeps: dropping stale cache entry ${_unideps_v}=${${_unideps_v}}")
+            unset(${_unideps_v} CACHE)
+        endif()
+    endforeach()
+endif()
+"#);
+        writeln!(&mut out).unwrap();
+
         for node in nodes {
             if let Some(ref prefix) = node.install_prefix {
                 let norm = prefix.to_string_lossy().replace('\\', "/");
@@ -550,6 +598,18 @@ mod tests {
         assert!(content.contains(&format!("IMPORTED_LOCATION \"{norm}/libfoo.a\"")));
         assert!(content.contains(&format!("INTERFACE_LINK_LIBRARIES \"{norm}/libbar.a\"")));
         assert!(content.contains("library 'missing' of 'pkg' not found"));
+    }
+
+    #[test]
+    fn test_install_prefixes_are_exported() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = node_with(DependencyDetails::default(), temp.path());
+        let content = CMakeGenerator::generate_targets_cmake(&[&node]);
+        let norm = temp.path().to_string_lossy().replace('\\', "/");
+        assert!(content.contains("set(UNIDEPS_INSTALL_PREFIXES \"\")"));
+        assert!(content.contains(&format!("list(APPEND UNIDEPS_INSTALL_PREFIXES \"{norm}\")")));
+        // Stale <Pkg>_DIR entries from a previous build of the same package are dropped.
+        assert!(content.contains("unset(${_unideps_v} CACHE)"));
     }
 
     #[test]

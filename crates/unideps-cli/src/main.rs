@@ -67,6 +67,14 @@ fn run() -> anyhow::Result<()> {
             let _lock = FileLock::acquire(storage.global_build_lock_path())?;
             GitSource::remove_dir_all_force(storage.scratch_dir())?;
             println!("UniDeps scratch directory cleaned: {}", storage.scratch_dir().display());
+            // Probe results used to be cached; they are scratch space now, so drop the leftovers.
+            if let Ok(entries) = std::fs::read_dir(storage.cache_dir()) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().is_some_and(|e| e == "opts") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
             Ok(())
         }
     }

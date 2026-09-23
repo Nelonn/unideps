@@ -11,7 +11,7 @@ UniDeps reads `unideps.toml` (plus an optional, uncommitted `.local.toml` next t
 ```
 <base dir>  (default: ~/.unideps)
 ├── sources/    <- git checkouts and patched source trees
-├── scratch/    <- CMake build directories (wiped by `unideps clean`)
+├── scratch/    <- CMake build directories (removed after each build unless `keep_build_dirs`)
 ├── installed/  <- installed package prefixes
 ├── cache/      <- compressed .tar.zst packages
 ├── locks/      <- lock files serialising concurrent runs
@@ -217,7 +217,7 @@ Machine-specific settings, placed next to `unideps.toml` and not committed:
 [storage]
 base_dir = "D:/unideps"        # storage directory
 scratch_dir = "R:/unideps-tmp" # build directories (e.g. a RAM disk)
-keep_build_dirs = false        # delete build directories after a successful build
+keep_build_dirs = true         # keep build directories after a successful build (default: false)
 
 [resources]
 max_jobs = 8                   # passed to `cmake --build --parallel`
@@ -325,6 +325,16 @@ The `unideps` executable is looked up on `PATH` and next to the module (`../targ
 
 Editing `unideps.toml` re-runs CMake configure automatically.
 
+### Runtime libraries
+
+Shared libraries of the built dependencies (`*.dll` on Windows, `*.dylib` on macOS, `*.so*` elsewhere) are copied at configure time next to your binaries, so the executables can be run straight from the build tree:
+
+- Windows: `CMAKE_RUNTIME_OUTPUT_DIRECTORY`, set to `<build>/bin` if you have not set it (your executables then go there too);
+- macOS/Linux: `CMAKE_LIBRARY_OUTPUT_DIRECTORY`, set to `<build>/lib` if you have not set it;
+- multi-config generators get one copy per configuration (`bin/Debug`, `bin/Release`, ...).
+
+Set the output directory variable before `unideps_setup()` to change the destination. Nothing is copied when building inside another unideps run.
+
 ### Variables in `cmake_options`
 
 `${NAME}` in a `cmake_options` value (of a dependency, an override, a `[[strategy]]` rule or a recipe) is replaced by the value of the CMake variable `NAME` of the project that calls `unideps_setup()`; `$ENV{NAME}` by an environment variable:
@@ -367,7 +377,7 @@ If the source of a dependency contains a `unideps.toml`, unideps builds the depe
 - their prefixes are added to `CMAKE_PREFIX_PATH` of the dependency's build and their build ids are part of the dependency's build id;
 - the dependency's own `unideps_setup()` does **not** start `unideps`: the outer run generates a targets file for the nested dependencies and passes it as `UNIDEPS_NESTED_TARGETS`, which `unideps_setup()` includes. `MANIFEST`, `TARGET_FILE` and the other parameters are ignored in this mode;
 - `[strategy]` rules of the nested manifest apply to its dependencies; `[presets]`, `[targets]`, `[overrides]` and `.local.toml` of the nested manifest are ignored, the outer ones are used for local tools and resource limits;
-- `enabled_if` in the nested manifest refers to the options of the dependency itself: its `option()` defaults, overridden by the dependency's `cmake_options` (the options of the outer project are not used). They are only known once its CMake has run, so unideps first configures the dependency once in a scratch directory (`[PROBE]`); its `unideps_setup()` writes the options declared before it and stops the configure. The result is cached, and the probe is skipped if no nested dependency uses `enabled_if`. Declare the options **before** `unideps_setup()`, and keep the dependency's `cmake/unideps.cmake` up to date: an older copy cannot be probed and all `enabled_if` dependencies are treated as disabled (with a warning);
+- `enabled_if` in the nested manifest refers to the options of the dependency itself: its `option()` defaults, overridden by the dependency's `cmake_options` (the options of the outer project are not used). They are only known once its CMake has run, so unideps first configures the dependency once in a scratch directory (`[PROBE]`); its `unideps_setup()` writes the options declared before it and stops the configure. The probe runs in scratch space and its result is never cached, and it is skipped if no nested dependency uses `enabled_if`. Declare the options **before** `unideps_setup()`, and keep the dependency's `cmake/unideps.cmake` up to date: an older copy cannot be probed and all `enabled_if` dependencies are treated as disabled (with a warning);
 - cycles between nested manifests are reported as an error;
 - only target dependencies are inspected, `[tools]` are not. `unideps fetch` follows nested manifests too.
 

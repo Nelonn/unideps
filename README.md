@@ -74,7 +74,7 @@ By default everything lives in `~/.unideps` and is shared between projects. Over
 | Directory | Contents |
 |---|---|
 | `sources/` | Git checkouts and patched source trees |
-| `scratch/` | Build directories (`unideps clean` wipes this) |
+| `scratch/` | Build directories (removed after each build unless `keep_build_dirs`; `unideps clean` wipes this) |
 | `installed/` | Installed package prefixes |
 | `cache/` | Compressed `.tar.zst` package archives |
 | `logs/` | configure/build/install logs per package |

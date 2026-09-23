@@ -485,7 +485,8 @@ fn build_nested(
 /// Options a package declares in its CMake before it reaches `unideps_setup()`. They are
 /// not known without running CMake, so the package is configured once in a scratch
 /// directory (its `unideps_setup()` writes them out and stops the configure). The result
-/// is cached under the same key as the build id, without the nested packages.
+/// is scratch space too: it is never stored in the cache, so a probe always reflects the
+/// current sources and options.
 fn probe_options(
     ctx: &BuildContext,
     node: &DependencyNode,
@@ -495,39 +496,45 @@ fn probe_options(
     let dep_ids: Vec<&str> = dep_nodes.iter().filter_map(|d| d.build_id.as_deref()).collect();
     let key = HashCalculator::calculate_build_id(node, &ctx.target, &ctx.host, &dep_ids);
     let name = format!("{}-probe-{key}", node.name);
-    let cached = ctx.storage.cache_dir().join(format!("{name}.opts"));
 
-    if !cached.is_file() {
-        println!("[PROBE] {} ({key})", node.name);
-        let scratch = ctx.storage.scratch_dir().join(&name);
-        GitSource::remove_dir_all_force(&scratch)?;
-        std::fs::create_dir_all(&scratch)?;
-        let out = std::path::absolute(scratch.join("options.txt"))?;
-        run_cmake(
-            ctx,
-            dep_nodes,
-            node,
-            src_dir,
-            &scratch.join("build"),
-            &ctx.storage.installed_dir().join(&name),
-            CmakeMode::Probe(&out),
-        )?;
-        if !out.is_file() {
-            let log = ctx.storage.logs_dir().join(&name).join("configure.log");
-            warn(format!(
-                "could not read the options of '{}', so its optional dependencies (`enabled_if`) are treated as disabled. Does its cmake/unideps.cmake support nested builds (update it) and does the configure reach unideps_setup()? Log: {}",
-                node.name,
-                log.display()
-            ));
-            return Ok(BTreeMap::new());
+    println!("[PROBE] {} ({key})", node.name);
+    let scratch = ctx.storage.scratch_dir().join(&name);
+    GitSource::remove_dir_all_force(&scratch)?;
+    std::fs::create_dir_all(&scratch)?;
+    let out = std::path::absolute(scratch.join("options.txt"))?;
+    let res = run_cmake(
+        ctx,
+        dep_nodes,
+        node,
+        src_dir,
+        &scratch.join("build"),
+        &scratch.join("install"),
+        CmakeMode::Probe(&out),
+    );
+    let content = match res {
+        Ok(()) if out.is_file() => Some(std::fs::read_to_string(&out)?),
+        Ok(()) => None,
+        Err(e) => {
+            if !ctx.project.keep_build_dirs() {
+                let _ = GitSource::remove_dir_all_force(&scratch);
+            }
+            return Err(e);
         }
-        std::fs::copy(&out, &cached)?;
-        if !ctx.project.keep_build_dirs() {
-            let _ = GitSource::remove_dir_all_force(&scratch);
-        }
+    };
+    if !ctx.project.keep_build_dirs() {
+        let _ = GitSource::remove_dir_all_force(&scratch);
     }
 
-    let content = std::fs::read_to_string(&cached)?;
+    let Some(content) = content else {
+        let log = ctx.storage.logs_dir().join(&name).join("configure.log");
+        warn(format!(
+            "could not read the options of '{}', so its optional dependencies (`enabled_if`) are treated as disabled. Does its cmake/unideps.cmake support nested builds (update it) and does the configure reach unideps_setup()? Log: {}",
+            node.name,
+            log.display()
+        ));
+        return Ok(BTreeMap::new());
+    };
+
     Ok(content
         .lines()
         .filter_map(|l| l.split_once('='))

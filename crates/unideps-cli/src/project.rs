@@ -82,12 +82,14 @@ impl Project {
         Some(resolve_relative(&self.manifest_dir, dir))
     }
 
+    /// Build directories are scratch space: they are removed after a successful build
+    /// unless `storage.keep_build_dirs` in `.local.toml` asks to keep them.
     pub fn keep_build_dirs(&self) -> bool {
         self.local
             .as_ref()
             .and_then(|l| l.storage.as_ref())
             .and_then(|s| s.keep_build_dirs)
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     pub fn max_jobs(&self) -> Option<usize> {
@@ -384,6 +386,20 @@ mod tests {
         let (_t, p) = project_with("[dependencies.a]\ngit = \"u\"\nstrategy = \"meson\"\n");
         let err = p.unwrap().build_graph().unwrap_err().to_string();
         assert!(err.contains("unknown strategy"), "{err}");
+    }
+
+    #[test]
+    fn build_dirs_are_removed_unless_local_toml_opts_out() {
+        let (_t, p) = project_with("");
+        assert!(!p.unwrap().keep_build_dirs());
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("unideps.toml"), "").unwrap();
+        std::fs::write(temp.path().join(".local.toml"), "[storage]
+keep_build_dirs = true
+").unwrap();
+        let p = Project::load(&temp.path().join("unideps.toml")).unwrap();
+        assert!(p.keep_build_dirs());
     }
 
     #[test]
