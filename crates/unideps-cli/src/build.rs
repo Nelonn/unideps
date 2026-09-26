@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use unideps_builder::git::GitSource;
 use unideps_builder::lock::FileLock;
+use unideps_builder::resolution::{Resolution, is_recordable};
 use unideps_builder::runners::cmake::{CMakeBuild, CMakeRunner};
 use unideps_builder::storage::StorageManager;
 use unideps_cache::packager::Packager;
@@ -95,6 +96,8 @@ struct BuildContext<'a> {
     host: TargetTriple,
     strategy: StrategyEngine,
     storage: &'a StorageManager,
+    /// Shared for the whole run so that a checkout is brought up to date only once.
+    sources: &'a Sources<'a>,
     c_compiler: Option<PathBuf>,
     cxx_compiler: Option<PathBuf>,
     toolchain_file: Option<PathBuf>,
@@ -127,6 +130,7 @@ impl<'a> BuildContext<'a> {
             host: self.host.clone(),
             strategy,
             storage: self.storage,
+            sources: self.sources,
             c_compiler: self.c_compiler.clone(),
             cxx_compiler: self.cxx_compiler.clone(),
             toolchain_file: self.toolchain_file.clone(),
@@ -320,6 +324,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     let storage = StorageManager::new(project.base_dir(args.base_dir.as_deref())).with_scratch_dir(project.scratch_dir());
 
+    let sources = Sources::new(&storage);
     let ctx = BuildContext {
         project: &project,
         host_compiler: detect_default_compiler(&host),
@@ -327,6 +332,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         host,
         strategy: StrategyEngine::new(&m.strategy),
         storage: &storage,
+        sources: &sources,
         c_compiler,
         cxx_compiler,
         toolchain_file,
@@ -342,7 +348,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     storage.ensure_dirs()?;
     println!("Storage: {}", storage.base_dir().display());
-    let _build_lock = FileLock::acquire(storage.global_build_lock_path())?;
+    // Runs no longer wait for each other: each package is locked while it is installed
+    // (see `build_node`). The shared lock only keeps `unideps clean` from pulling the
+    // scratch directories out from under a build in progress.
+    let _run_lock = FileLock::acquire_shared(storage.global_build_lock_path())?;
 
     let built_nodes = build_project(&ctx, &mut graph, &mut NestedStack::new())?;
 
@@ -438,8 +447,9 @@ struct Nested {
     targets_cmake: String,
 }
 
-/// Builds the dependencies of `<src_dir>/unideps.toml`, if there is one. This runs in
-/// the current process, under the build lock we already hold.
+/// Builds the dependencies of `<src_dir>/unideps.toml`, if there is one. This runs in the
+/// current process; a package that is already installed never gets here, because its
+/// `Resolution` record already says what this would produce.
 fn build_nested(
     ctx: &BuildContext,
     node: &DependencyNode,
@@ -486,7 +496,8 @@ fn build_nested(
 /// not known without running CMake, so the package is configured once in a scratch
 /// directory (its `unideps_setup()` writes them out and stops the configure). The result
 /// is scratch space too: it is never stored in the cache, so a probe always reflects the
-/// current sources and options.
+/// current sources and options. What it leads to is remembered instead, by
+/// `unideps_builder::resolution`, so an installed package is never probed again.
 fn probe_options(
     ctx: &BuildContext,
     node: &DependencyNode,
@@ -498,17 +509,22 @@ fn probe_options(
     let name = format!("{}-probe-{key}", node.name);
 
     println!("[PROBE] {} ({key})", node.name);
-    let scratch = ctx.storage.scratch_dir().join(&name);
+    // The pid keeps a parallel run from deleting the scratch directory of this one.
+    let scratch = ctx
+        .storage
+        .scratch_dir()
+        .join(format!("{name}-{}", std::process::id()));
     GitSource::remove_dir_all_force(&scratch)?;
     std::fs::create_dir_all(&scratch)?;
     let out = std::path::absolute(scratch.join("options.txt"))?;
+    // The install prefix names the log directory, so this is where the warning below points.
     let res = run_cmake(
         ctx,
         dep_nodes,
         node,
         src_dir,
         &scratch.join("build"),
-        &scratch.join("install"),
+        &scratch.join(&name),
         CmakeMode::Probe(&out),
     );
     let content = match res {
@@ -566,11 +582,29 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
         return Ok(Built { node, nested: Vec::new() });
     }
 
-    let sources = Sources { storage: ctx.storage };
+    let sources = ctx.sources;
     sources.resolve_floating_ref(&mut node)?;
 
     let source_id = HashCalculator::calculate_source_id(&node);
     node.source_id = Some(source_id.clone());
+
+    let mut dep_build_ids: Vec<&str> = deps.iter().filter_map(|&d| graph.graph[d].build_id.as_deref()).collect();
+
+    // What the package's own `unideps.toml` pulled in the last time is remembered under the
+    // build id it would have without it, which is known here. That makes an installed
+    // package a cache hit before its source is fetched and, for a package with a nested
+    // manifest, before it is configured once just to read its options back out.
+    let plain_id = HashCalculator::calculate_build_id(&node, &ctx.target, &ctx.host, &dep_build_ids);
+    if let Some(resolution) = Resolution::load(ctx.storage, &node.name, &plain_id) {
+        println!("[CACHE HIT] {} ({})", node.name, resolution.build_id);
+        node.install_prefix = Some(
+            ctx.storage
+                .installed_dir()
+                .join(format!("{}-{}", node.name, resolution.build_id)),
+        );
+        node.build_id = Some(resolution.build_id);
+        return Ok(Built { node, nested: resolution.nested });
+    }
 
     // The nested dependencies are part of this package's build, so they have to be
     // known (and built) before its build id can be computed. This needs the source
@@ -580,7 +614,6 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
     let nested = build_nested(ctx, &node, &direct_deps, &src_dir, &source_id, stack)?;
     let nested_nodes: &[DependencyNode] = nested.as_ref().map_or(&[], |n| n.nodes.as_slice());
 
-    let mut dep_build_ids: Vec<&str> = deps.iter().filter_map(|&d| graph.graph[d].build_id.as_deref()).collect();
     dep_build_ids.extend(nested_nodes.iter().filter_map(|n| n.build_id.as_deref()));
     let build_id = HashCalculator::calculate_build_id(&node, &ctx.target, &ctx.host, &dep_build_ids);
     node.build_id = Some(build_id.clone());
@@ -590,8 +623,32 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
     node.install_prefix = Some(install_dir.clone());
     let archive_name = format!("{dir_name}.tar.zst");
     let cached_archive = ctx.storage.cache_dir().join(&archive_name);
-    let done = |node: DependencyNode| Built { node, nested: nested_nodes.to_vec() };
+    // A nested package that is re-resolved on every run (a branch, a `path` source) is not
+    // this package's forever, and a tool the project points at a local path is not unideps'
+    // to remember either; a resolution holding one keeps being worked out from scratch.
+    // Recording the rest is best effort: the only loss is that the next run resolves again.
+    let recordable = nested_nodes
+        .iter()
+        .all(|n| is_recordable(n) && ctx.project.local_tool_path(&n.name).is_none());
+    let done = |node: DependencyNode| {
+        let built = Built { node, nested: nested_nodes.to_vec() };
+        if recordable {
+            let record = Resolution::new(&built.node.name, &build_id, built.nested.clone());
+            if let Err(e) = record.store(ctx.storage, &plain_id) {
+                warn(format!("{e:#}"));
+            }
+        }
+        built
+    };
 
+    if StorageManager::is_installed(&install_dir) {
+        println!("[CACHE HIT] {} ({build_id})", node.name);
+        return Ok(done(node));
+    }
+
+    // Only the run that actually installs this package holds a lock, and only for as long
+    // as it takes; the others wait for this package instead of for the whole build.
+    let _package_lock = FileLock::acquire(ctx.storage.package_lock_path(&dir_name))?;
     if StorageManager::is_installed(&install_dir) {
         println!("[CACHE HIT] {} ({build_id})", node.name);
         return Ok(done(node));
@@ -847,8 +904,8 @@ pub fn fetch(manifest: &Path, base_dir: Option<&Path>) -> Result<()> {
     let project = Project::load(manifest)?;
     let storage = StorageManager::new(project.base_dir(base_dir));
     storage.ensure_dirs()?;
-    let _lock = FileLock::acquire(storage.global_build_lock_path())?;
-    let sources = Sources { storage: &storage };
+    let _run_lock = FileLock::acquire_shared(storage.global_build_lock_path())?;
+    let sources = Sources::new(&storage);
     fetch_project(&project, &sources, &mut BTreeSet::new())?;
     println!("All sources fetched");
     Ok(())

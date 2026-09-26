@@ -3,13 +3,14 @@ use crate::manifest::{DependencySpec, ToolRequirement};
 use crate::strategy::EffectiveConfig;
 use crate::target::TargetTriple;
 use petgraph::algo::toposort;
+use serde::{Deserialize, Serialize};
 use petgraph::graph::DiGraph;
 pub use petgraph::Direction;
 pub use petgraph::graph::NodeIndex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
     TargetDependency,
     HostTool,
@@ -24,7 +25,7 @@ impl NodeKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyNode {
     pub name: String,
     pub kind: NodeKind,

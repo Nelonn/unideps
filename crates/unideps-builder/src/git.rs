@@ -59,6 +59,8 @@ impl GitSource {
         if dest_path.exists() {
             match Self::existing_checkout_state(dest_path, url, git_ref) {
                 CheckoutState::UpToDate(head) => return Ok(head),
+                // The revision is already there, so discard the edits without touching the network.
+                CheckoutState::Dirty(head) => return Self::restore(dest_path, &head, shallow),
                 CheckoutState::Reusable => {
                     return Self::sync(dest_path, url, git_ref, shallow);
                 }
@@ -104,11 +106,29 @@ impl GitSource {
                 .unwrap_or(false),
             GitRef::Branch(_) | GitRef::DefaultHead => false,
         };
-        if matches {
-            CheckoutState::UpToDate(head)
-        } else {
-            CheckoutState::Reusable
+        if !matches {
+            return CheckoutState::Reusable;
         }
+        // Patches used to be applied in the checkout itself, and a build or a manual edit can
+        // leave files behind as well. Such a tree must not be handed out as pristine sources.
+        match Self::capture(dest, &["status", "--porcelain"]) {
+            Ok(status) if status.trim().is_empty() => CheckoutState::UpToDate(head),
+            Ok(_) => CheckoutState::Dirty(head),
+            Err(_) => CheckoutState::Reusable,
+        }
+    }
+
+    /// Resets a dirty checkout back to the revision it already has.
+    fn restore(dest: &Path, head: &str, shallow: bool) -> Result<String> {
+        Self::run(dest, &["reset", "--quiet", "--hard", head], "git reset --hard")?;
+        Self::run(dest, &["clean", "-ffdxq"], "git clean")?;
+        Self::update_submodules(dest, shallow)?;
+        let restored = Self::get_head_commit(dest)?;
+        if restored != head {
+            anyhow::bail!("Restoring {} ended at {restored}, expected {head}", dest.display());
+        }
+        std::fs::write(dest.join(".git").join(CHECKOUT_MARKER), &restored)?;
+        Ok(restored)
     }
 
     fn sync(dest: &Path, url: &str, git_ref: GitRef, shallow: bool) -> Result<String> {
@@ -157,6 +177,12 @@ impl GitSource {
             anyhow::anyhow!("{} not found in {url}", git_ref.describe())
         })?;
 
+        // A branch that still points at the commit already checked out: resetting, cleaning
+        // and walking the submodules would only reproduce the tree that is already there.
+        if Self::is_pristine_at(dest, &resolved) {
+            return Ok(resolved);
+        }
+
         Self::run(dest, &["reset", "--quiet", "--hard", &resolved], "git reset --hard")?;
         // reset --hard keeps untracked files, e.g. submodules deleted upstream;
         // a single -f would skip them because they are nested repositories.
@@ -169,6 +195,18 @@ impl GitSource {
         }
         std::fs::write(dest.join(".git").join(CHECKOUT_MARKER), &head)?;
         Ok(head)
+    }
+
+    /// Whether `dest` already holds `commit` as a complete, unmodified checkout.
+    fn is_pristine_at(dest: &Path, commit: &str) -> bool {
+        if Self::get_head_commit(dest).ok().as_deref() != Some(commit) {
+            return false;
+        }
+        let marker = std::fs::read_to_string(dest.join(".git").join(CHECKOUT_MARKER)).unwrap_or_default();
+        if marker.trim() != commit {
+            return false;
+        }
+        Self::capture(dest, &["status", "--porcelain"]).is_ok_and(|s| s.trim().is_empty())
     }
 
     fn update_submodules(dest: &Path, shallow: bool) -> Result<()> {
@@ -287,6 +325,8 @@ impl GitSource {
 
 enum CheckoutState {
     UpToDate(String),
+    /// Pinned revision is checked out, but the working tree was modified.
+    Dirty(String),
     Reusable,
     Invalid,
 }
@@ -321,6 +361,43 @@ mod tests {
         let c2 = git(&up, &["rev-parse", "HEAD"]);
         let url = up.to_string_lossy().replace('\\', "/");
         (url, c1, c2)
+    }
+
+    #[test]
+    fn modified_checkout_is_restored_not_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let (url, c1, _) = upstream(temp.path());
+        let dest = temp.path().join("dest");
+        assert_eq!(GitSource::fetch_and_checkout(&url, &dest, GitRef::Tag("v1"), true).unwrap(), c1);
+
+        // e.g. a patch that an older version applied in the checkout itself.
+        std::fs::write(dest.join("f.txt"), "patched").unwrap();
+        std::fs::write(dest.join("stray.txt"), "junk").unwrap();
+
+        assert_eq!(GitSource::fetch_and_checkout(&url, &dest, GitRef::Tag("v1"), true).unwrap(), c1);
+        assert_eq!(std::fs::read_to_string(dest.join("f.txt")).unwrap(), "one");
+        assert!(!dest.join("stray.txt").exists());
+    }
+
+    /// The second checkout of an unmoved branch skips the reset, so the checks that used
+    /// to come with it have to hold on their own.
+    #[test]
+    fn unmoved_branch_is_left_alone_but_still_cleaned() {
+        let temp = tempfile::tempdir().unwrap();
+        let (url, _, c2) = upstream(temp.path());
+        let dest = temp.path().join("br");
+        assert_eq!(GitSource::fetch_and_checkout(&url, &dest, GitRef::Branch("main"), true).unwrap(), c2);
+
+        // Untouched: same commit, same content, no re-checkout needed.
+        assert_eq!(GitSource::fetch_and_checkout(&url, &dest, GitRef::Branch("main"), true).unwrap(), c2);
+        assert_eq!(std::fs::read_to_string(dest.join("f.txt")).unwrap(), "two");
+
+        // Modified: the tree is restored even though the branch has not moved.
+        std::fs::write(dest.join("f.txt"), "local edit").unwrap();
+        std::fs::write(dest.join("stray.txt"), "junk").unwrap();
+        assert_eq!(GitSource::fetch_and_checkout(&url, &dest, GitRef::Branch("main"), true).unwrap(), c2);
+        assert_eq!(std::fs::read_to_string(dest.join("f.txt")).unwrap(), "two");
+        assert!(!dest.join("stray.txt").exists());
     }
 
     #[test]

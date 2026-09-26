@@ -13,6 +13,16 @@ pub struct FileLock {
 
 impl FileLock {
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(path, true)
+    }
+
+    /// Any number of holders at once, but never together with an exclusive one. Used by a
+    /// build to keep `unideps clean` out while still running next to other builds.
+    pub fn acquire_shared(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(path, false)
+    }
+
+    fn open(path: impl AsRef<Path>, exclusive: bool) -> Result<Self> {
         let p = path.as_ref().to_path_buf();
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
@@ -26,8 +36,9 @@ impl FileLock {
             .open(&p)
             .with_context(|| format!("Failed to open lock file: {}", p.display()))?;
 
-        FileExt::lock(&file)
-            .with_context(|| format!("Failed to acquire exclusive lock on: {}", p.display()))?;
+        let kind = if exclusive { "exclusive" } else { "shared" };
+        let res = if exclusive { FileExt::lock(&file) } else { FileExt::lock_shared(&file) };
+        res.with_context(|| format!("Failed to acquire {kind} lock on: {}", p.display()))?;
 
         Ok(Self {
             file: Some(file),
@@ -82,5 +93,17 @@ mod tests {
         }
         assert_eq!(max_inside.load(Ordering::SeqCst), 1);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn shared_locks_do_not_exclude_each_other() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("locks/shared.lock");
+        let a = FileLock::acquire_shared(&path).unwrap();
+        let b = FileLock::acquire_shared(&path).unwrap();
+        drop((a, b));
+        // ... but an exclusive one still waits for them, which `acquire` here can only show
+        // by succeeding once they are gone.
+        let _excl = FileLock::acquire(&path).unwrap();
     }
 }

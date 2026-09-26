@@ -14,13 +14,14 @@ UniDeps reads `unideps.toml` (plus an optional, uncommitted `.local.toml` next t
 ├── scratch/    <- CMake build directories (removed after each build unless `keep_build_dirs`)
 ├── installed/  <- installed package prefixes
 ├── cache/      <- compressed .tar.zst packages
+├── resolved/   <- what each package's own unideps.toml resolved to
 ├── locks/      <- lock files serialising concurrent runs
 └── logs/       <- configure/build/install logs per package
 ```
 
 The storage directory is chosen in this order: `--base-dir` (or `unideps_setup(BASE_DIR ...)`), the `UNIDEPS_DIR` / `UNIDEPS_BASE_DIR` environment variables, `storage.base_dir` in `.local.toml`, then `~/.unideps`.
 
-Runs that share a storage directory are serialised with a lock file, so parallel CMake configures are safe.
+Runs that share a storage directory work side by side: locks are taken per checkout and per package, only while that one is fetched or installed, so parallel CMake configures never wait for each other's whole build. `unideps clean` takes the storage exclusively and waits for the runs in progress.
 
 ### Two-Level Hashing
 
@@ -40,6 +41,16 @@ Runs that share a storage directory are serialised with a lock file, so parallel
    - `build_id`s of all transitive dependencies.
 
 A package is installed to `installed/<name>-<build_id>` and archived to `cache/<name>-<build_id>.tar.zst`. An install counts as complete only after it finishes; interrupted builds and corrupt archives are detected and rebuilt.
+
+### Resolution Records
+
+A package's `build_id` also covers whatever its own nested `unideps.toml` pulled in, which is only known after fetching its source and — with `enabled_if` — configuring it once to read its options back out. Doing that on every run would mean a git checkout and a full CMake configure per package just to conclude that the package is already installed.
+
+So the outcome is written to `resolved/<name>-<id>.json`: the `build_id` the package really got and the packages its manifest pulled in. The key `<id>` is the `build_id` the package would have if its manifest pulled in nothing, which is known before the source is touched. Everything that can change the outcome — the revision, the patches, the options, the toolchain, the dependencies — is already part of that key, so a stale record cannot be found under it.
+
+A run that finds a record, and finds every prefix it names still installed, reports the cache hit immediately: no fetch, no probe, no configure. Anything else — a missing or unreadable record, a record from an older unideps, a prefix deleted by hand, a moved storage directory — falls back to resolving the package again and rewrites the record.
+
+Nothing is recorded when the nested manifest pulls in a source that is re-resolved on every run — a `branch`, no ref at all, a `path` source, or a tool the project points at a local path. The key cannot cover where those point *now*, so such a package is resolved from scratch every run and picks up a moved branch as it always did.
 
 Tags and commits are treated as immutable, so cache hits for them need no network access. Branch sources are fetched on every run to pick up new commits.
 

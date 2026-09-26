@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use unideps_builder::git::{GitRef, GitSource};
+use unideps_builder::lock::FileLock;
 use unideps_builder::patch::PatchApplier;
 use unideps_builder::storage::StorageManager;
 use unideps_core::graph::DependencyNode;
@@ -8,6 +11,19 @@ use unideps_core::hash::HashCalculator;
 
 pub struct Sources<'a> {
     pub storage: &'a StorageManager,
+    /// Checkouts this run has already brought to the wanted revision. A floating ref is
+    /// resolved before hashing and used again when the package is built; without this the
+    /// whole fetch / reset / submodule walk would run a second time for every such package.
+    synced: RefCell<HashSet<PathBuf>>,
+}
+
+impl<'a> Sources<'a> {
+    pub fn new(storage: &'a StorageManager) -> Self {
+        Self {
+            storage,
+            synced: RefCell::new(HashSet::new()),
+        }
+    }
 }
 
 fn git_ref(node: &DependencyNode) -> GitRef<'_> {
@@ -34,6 +50,22 @@ impl Sources<'_> {
         self.storage.sources_dir().join(format!("{}-{ref_part}-{url_hash}", node.name))
     }
 
+    /// Serialises the runs that share a storage directory on the level of one checkout,
+    /// instead of making them wait for each other's whole build.
+    fn lock_checkout(&self, dir: &Path) -> Result<FileLock> {
+        let name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        FileLock::acquire(self.storage.source_lock_path(&name))
+    }
+
+    /// Brings `dir` to `git_ref`, at most once per run.
+    fn checkout(&self, node: &DependencyNode, url: &str, dir: &Path) -> Result<String> {
+        let _lock = self.lock_checkout(dir)?;
+        let head = GitSource::fetch_and_checkout(url, dir, git_ref(node), node.shallow)
+            .with_context(|| format!("Failed to fetch '{}'", node.name))?;
+        self.synced.borrow_mut().insert(dir.to_path_buf());
+        Ok(head)
+    }
+
     /// Floating refs must be fetched before hashing so the commit becomes part of
     /// `source_id`. Tags and commits are fetched only when building, so cache hits
     /// need no network access.
@@ -47,9 +79,7 @@ impl Sources<'_> {
         }
         let dir = self.checkout_dir(node, &url);
         println!("[FETCH] {} ({url})", node.name);
-        let head = GitSource::fetch_and_checkout(&url, &dir, git_ref(node), node.shallow)
-            .with_context(|| format!("Failed to fetch '{}'", node.name))?;
-        node.resolved_commit = Some(head);
+        node.resolved_commit = Some(self.checkout(node, &url, &dir)?);
         Ok(())
     }
 
@@ -62,8 +92,14 @@ impl Sources<'_> {
             .as_deref()
             .with_context(|| format!("'{}' has no git URL or path", node.name))?;
         let dir = self.checkout_dir(node, url);
-        let head = GitSource::fetch_and_checkout(url, &dir, git_ref(node), node.shallow)
-            .with_context(|| format!("Failed to fetch '{}'", node.name))?;
+        // Already brought up to date by `resolve_floating_ref`; repeating the whole fetch,
+        // reset and submodule walk would only reproduce the tree that is already there. The
+        // checkout is shared with other runs, so what it holds is still worth confirming.
+        let head = if self.synced.borrow().contains(&dir) {
+            GitSource::get_head_commit(&dir).with_context(|| format!("Failed to read the checkout of '{}'", node.name))?
+        } else {
+            self.checkout(node, url, &dir)?
+        };
         if let Some(ref expected) = node.resolved_commit
             && &head != expected
         {
@@ -79,6 +115,11 @@ impl Sources<'_> {
         }
         let patched = self.storage.sources_dir().join(format!("{}-{source_id}", node.name));
         let marker = patched.join(".unideps-patched");
+        if marker.exists() {
+            return Ok(patched);
+        }
+        // Another run may be building the same patched tree; re-check once it is done.
+        let _lock = self.lock_checkout(&patched)?;
         if marker.exists() {
             return Ok(patched);
         }

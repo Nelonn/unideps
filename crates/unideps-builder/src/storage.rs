@@ -47,12 +47,22 @@ impl StorageManager {
         self.base_dir.join("logs")
     }
 
+    /// What each package's own `unideps.toml` resolved to; see `crate::resolution`.
+    pub fn resolved_dir(&self) -> PathBuf {
+        self.base_dir.join("resolved")
+    }
+
     pub fn locks_dir(&self) -> PathBuf {
         self.base_dir.join("locks")
     }
 
     pub fn package_lock_path(&self, dir_name: &str) -> PathBuf {
         self.locks_dir().join(format!("{dir_name}.lock"))
+    }
+
+    /// Guards one checkout directory, so that two runs never fetch into it at once.
+    pub fn source_lock_path(&self, dir_name: &str) -> PathBuf {
+        self.locks_dir().join(format!("src-{dir_name}.lock"))
     }
 
     pub fn global_build_lock_path(&self) -> PathBuf {
@@ -74,6 +84,7 @@ impl StorageManager {
         std::fs::create_dir_all(self.scratch_dir())?;
         std::fs::create_dir_all(self.logs_dir())?;
         std::fs::create_dir_all(self.locks_dir())?;
+        std::fs::create_dir_all(self.resolved_dir())?;
         Ok(())
     }
 }
