@@ -69,6 +69,12 @@ impl StorageManager {
         self.locks_dir().join("build.lock")
     }
 
+    /// Held only while compiling and installing a package. Cache hits and cache
+    /// extraction do not need this lock.
+    pub fn package_build_slot_lock_path(&self) -> PathBuf {
+        self.locks_dir().join("package-build.lock")
+    }
+
     pub fn is_installed(install_dir: &Path) -> bool {
         install_dir.join(INSTALL_MARKER).is_file()
     }

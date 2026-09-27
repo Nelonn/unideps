@@ -21,7 +21,7 @@ UniDeps reads `unideps.toml` (plus an optional, uncommitted `.local.toml` next t
 
 The storage directory is chosen in this order: `--base-dir` (or `unideps_setup(BASE_DIR ...)`), the `UNIDEPS_DIR` / `UNIDEPS_BASE_DIR` environment variables, `storage.base_dir` in `.local.toml`, then `~/.unideps`.
 
-Runs that share a storage directory work side by side: locks are taken per checkout and per package, only while that one is fetched or installed, so parallel CMake configures never wait for each other's whole build. `unideps clean` takes the storage exclusively and waits for the runs in progress.
+Runs that share a storage directory can read installed packages and extract different cached packages in parallel. A per-package lock prevents duplicate extraction or installation of the same build ID. One storage-wide build slot allows only one package to be compiled and installed at a time; cache hits do not take it. `unideps clean` takes the storage exclusively and waits for runs in progress.
 
 ### Two-Level Hashing
 

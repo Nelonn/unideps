@@ -62,6 +62,7 @@ impl Drop for FileLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StorageManager;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -105,5 +106,31 @@ mod tests {
         // ... but an exclusive one still waits for them, which `acquire` here can only show
         // by succeeding once they are gone.
         let _excl = FileLock::acquire(&path).unwrap();
+    }
+
+    #[test]
+    fn build_slot_blocks_other_builds_but_not_other_package_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StorageManager::new(temp.path().to_path_buf());
+        let slot = storage.package_build_slot_lock_path();
+        let _first_package = FileLock::acquire(storage.package_lock_path("first-id")).unwrap();
+        let first_build = FileLock::acquire(&slot).unwrap();
+
+        let second_package = storage.package_lock_path("second-id");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (built_tx, built_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _package = FileLock::acquire(second_package).unwrap();
+            ready_tx.send(()).unwrap();
+            let _build = FileLock::acquire(slot).unwrap();
+            built_tx.send(()).unwrap();
+        });
+
+        ready_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let blocked = built_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err();
+        drop(first_build);
+        built_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert!(blocked, "another package entered the build slot while it was occupied");
     }
 }

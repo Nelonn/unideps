@@ -348,9 +348,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     storage.ensure_dirs()?;
     println!("Storage: {}", storage.base_dir().display());
-    // Runs no longer wait for each other: each package is locked while it is installed
-    // (see `build_node`). The shared lock only keeps `unideps clean` from pulling the
-    // scratch directories out from under a build in progress.
+    // This shared lock keeps `unideps clean` out. A separate exclusive lock limits
+    // actual package builds to one at a time across all runs using this storage.
     let _run_lock = FileLock::acquire_shared(storage.global_build_lock_path())?;
 
     let built_nodes = build_project(&ctx, &mut graph, &mut NestedStack::new())?;
@@ -558,8 +557,16 @@ fn probe_options(
         .collect())
 }
 
+fn ordered_dependencies(graph: &DependencyGraph, idx: NodeIndex) -> Vec<NodeIndex> {
+    // Node indices can change when an unrelated enabled_if node is removed. Build IDs
+    // must depend on package identities, not on the graph's internal layout.
+    let mut deps: Vec<_> = graph.reachable(idx, Direction::Outgoing).into_iter().collect();
+    deps.sort_by(|&a, &b| graph.graph[a].name.cmp(&graph.graph[b].name));
+    deps
+}
+
 fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack: &mut NestedStack) -> Result<Built> {
-    let deps = graph.reachable(idx, Direction::Outgoing);
+    let deps = ordered_dependencies(graph, idx);
     let dependents: Vec<&str> = graph
         .reachable(idx, Direction::Incoming)
         .into_iter()
@@ -646,8 +653,8 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
         return Ok(done(node));
     }
 
-    // Only the run that actually installs this package holds a lock, and only for as long
-    // as it takes; the others wait for this package instead of for the whole build.
+    // Serialise installation of this build ID, including cache extraction. A
+    // different package can still be read from or unpacked from cache in parallel.
     let _package_lock = FileLock::acquire(ctx.storage.package_lock_path(&dir_name))?;
     if StorageManager::is_installed(&install_dir) {
         println!("[CACHE HIT] {} ({build_id})", node.name);
@@ -671,6 +678,10 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
         }
     }
 
+    // Keep the global build slot separate from the run/clean lock: every run
+    // holds the latter shared, so upgrading it here would deadlock. Acquire it
+    // only after the cache path, while still holding this package's lock.
+    let _build_slot = FileLock::acquire(ctx.storage.package_build_slot_lock_path())?;
     println!("[BUILD] {} ({build_id})", node.name);
     let build_scratch = ctx.storage.scratch_dir().join(&dir_name);
 
@@ -968,5 +979,39 @@ mod tests {
         let nested = vec![node("b", "/b1"), node("b", "/b2"), node("c", "/c"), node("c", "/c")];
         let merged = merge_nested(nested, Vec::new());
         assert_eq!(names(&merged), [("b", "/b1"), ("c", "/c")]);
+    }
+
+    #[test]
+    fn unrelated_filtered_node_does_not_change_dependency_order() {
+        let mut graph = DependencyGraph::new();
+        let curl = graph.add_or_get_node(node("curl", "/curl"));
+        let mut optional = node("googletest", "/googletest");
+        optional.enabled_if = Some("REWIDGET_TESTS".into());
+        graph.add_or_get_node(optional);
+        let mbedtls = graph.add_or_get_node(node("mbedtls", "/mbedtls"));
+        let nghttp2 = graph.add_or_get_node(node("nghttp2", "/nghttp2"));
+        let zlib = graph.add_or_get_node(node("zlib", "/zlib"));
+        graph.add_dependency(curl, zlib);
+        graph.add_dependency(curl, mbedtls);
+        graph.add_dependency(curl, nghttp2);
+
+        let before: Vec<_> = ordered_dependencies(&graph, curl)
+            .iter()
+            .map(|&i| graph.graph[i].name.clone())
+            .collect();
+        graph.filter_conditions(&BTreeMap::new());
+        let curl = graph.indices["curl"];
+        let index_order: Vec<_> = graph
+            .reachable(curl, Direction::Outgoing)
+            .iter()
+            .map(|&i| graph.graph[i].name.as_str())
+            .collect();
+        assert_ne!(index_order, ["mbedtls", "nghttp2", "zlib"]);
+        let after: Vec<_> = ordered_dependencies(&graph, curl)
+            .iter()
+            .map(|&i| graph.graph[i].name.clone())
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(after, ["mbedtls", "nghttp2", "zlib"]);
     }
 }
