@@ -4,6 +4,28 @@ use unideps_core::graph::DependencyNode;
 
 pub struct CMakeGenerator;
 
+/// Makes `value` a quoted CMake argument that means exactly the string it is, the way
+/// `-D<KEY>=<VALUE>` on a configure command line does. A Windows path is the usual reason:
+/// `C:\Users\Nelonn\...` inside quotes is read as the escape `\U` and fails to parse.
+/// `${...}` is not expanded either, because the command line does not expand it; the
+/// references unideps itself understands are already resolved by the time a value gets here.
+fn quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    for c in value.chars() {
+        match c {
+            '\\' | '"' | '$' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 impl CMakeGenerator {
     pub fn generate_targets_cmake(nodes: &[&DependencyNode]) -> String {
         let mut out = String::new();
@@ -11,6 +33,11 @@ impl CMakeGenerator {
         // include() runs in its own policy scope, so these only affect this file.
         writeln!(&mut out, "cmake_policy(SET CMP0057 NEW)").unwrap();
         writeln!(&mut out, "if(POLICY CMP0074)\n    cmake_policy(SET CMP0074 NEW)\nendif()").unwrap();
+        if nodes.iter().any(|n| n.subdir_source.is_some()) {
+            // So that the `option()` calls of a package added with add_subdirectory honour the
+            // values set for it below instead of resetting them to their own defaults.
+            writeln!(&mut out, "set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)").unwrap();
+        }
         writeln!(&mut out).unwrap();
 
         for node in nodes {
@@ -243,7 +270,7 @@ endif()
                     let initial_pkg = explicit_import.unwrap_or(name);
                     writeln!(&mut out, "set(_unideps_{name}_imported_pkg \"{initial_pkg}\")").unwrap();
                     if let Some(ver) = ver_opt {
-                        writeln!(&mut out, "set(_unideps_{name}_ver \"{ver}\")").unwrap();
+                        writeln!(&mut out, "set(_unideps_{name}_ver \"{}\")", quote(ver)).unwrap();
                     } else {
                         writeln!(&mut out, "set(_unideps_{name}_ver \"\")").unwrap();
                     }
@@ -320,11 +347,92 @@ endif()
 
                     writeln!(&mut out, "message(STATUS \"Imported: ${{_unideps_{name}_imported_pkg}} (${{_unideps_{name}_new_targets}}) ({norm})${{_unideps_{name}_ver_str}}\")").unwrap();
                 }
+            } else if node.subdir_source.is_some() {
+                Self::write_subdirectory(&mut out, node);
             }
         }
 
         writeln!(&mut out).unwrap();
         out
+    }
+
+    /// `cmake-subdirectory`: the consumer builds the package itself, from the sources
+    /// unideps prepared. Emitted in the same dependency order as everything else, so a
+    /// subdirectory package that another one uses is added first.
+    fn write_subdirectory(out: &mut String, node: &DependencyNode) {
+        let Some(ref src) = node.subdir_source else { return };
+        let src = src.to_string_lossy().replace('\\', "/");
+        let name = &node.name;
+
+        // The package reads this instead of running unideps again: its own `unideps.toml`
+        // was already resolved and built by the run that generated this file.
+        let mut set_before: Vec<(String, String)> = Vec::new();
+        if let Some(ref file) = node.subdir_nested_targets {
+            set_before.push((
+                "UNIDEPS_NESTED_TARGETS".into(),
+                file.to_string_lossy().replace('\\', "/"),
+            ));
+        }
+        if let Some(shared) = node.shared {
+            set_before.push(("BUILD_SHARED_LIBS".into(), if shared { "ON".into() } else { "OFF".into() }));
+        }
+        // Already resolved by the run that prepared the sources, so that `${<dep>.prefix}`
+        // means here exactly what it means on the configure command line of a normal build.
+        for (k, v) in &node.subdir_options {
+            set_before.push((k.clone(), v.clone()));
+        }
+
+        writeln!(out, "if(NOT TARGET {name} AND NOT TARGET {name}::{name})").unwrap();
+        // The values belong to this package's configure, not to the rest of the consumer's,
+        // so whatever the consumer had is put back afterwards.
+        for (k, v) in &set_before {
+            writeln!(out, "    set(_unideps_had_{k} FALSE)").unwrap();
+            writeln!(out, "    if(DEFINED {k})").unwrap();
+            writeln!(out, "        set(_unideps_had_{k} TRUE)").unwrap();
+            writeln!(out, "        set(_unideps_save_{k} \"${{{k}}}\")").unwrap();
+            writeln!(out, "    endif()").unwrap();
+            writeln!(out, "    set({k} \"{}\")", quote(v)).unwrap();
+        }
+        writeln!(
+            out,
+            "    add_subdirectory(\"{src}\" \"${{CMAKE_CURRENT_BINARY_DIR}}/_unideps/{name}\")"
+        )
+        .unwrap();
+        for (k, _) in set_before.iter().rev() {
+            writeln!(out, "    if(_unideps_had_{k})").unwrap();
+            writeln!(out, "        set({k} \"${{_unideps_save_{k}}}\")").unwrap();
+            writeln!(out, "    else()").unwrap();
+            writeln!(out, "        unset({k})").unwrap();
+            writeln!(out, "    endif()").unwrap();
+        }
+        writeln!(out, "endif()").unwrap();
+
+        // The package names its own targets; `<name>::<name>` is what the consumer expects,
+        // so alias it when only the plain name came out of the subdirectory.
+        let mut aliases: Vec<String> = vec![format!("{name}::{name}")];
+        if let Some(ref imp) = node.import_name {
+            aliases.push(format!("{imp}::{imp}"));
+            if imp != name {
+                aliases.push(imp.clone());
+            }
+        }
+        for alias in &aliases {
+            writeln!(out, "if(TARGET {name} AND NOT TARGET {alias})").unwrap();
+            writeln!(out, "    get_target_property(_unideps_{name}_type {name} TYPE)").unwrap();
+            writeln!(out, "    if(NOT _unideps_{name}_type STREQUAL \"EXECUTABLE\" AND NOT _unideps_{name}_type STREQUAL \"UTILITY\")").unwrap();
+            writeln!(out, "        add_library({alias} ALIAS {name})").unwrap();
+            writeln!(out, "    endif()").unwrap();
+            writeln!(out, "endif()").unwrap();
+        }
+
+        let expected = aliases.first().cloned().unwrap_or_default();
+        writeln!(out, "if(TARGET {expected})").unwrap();
+        writeln!(out, "    message(STATUS \"Subdirectory: {name} ({expected}) ({src})\")").unwrap();
+        writeln!(out, "elseif(TARGET {name})").unwrap();
+        writeln!(out, "    message(STATUS \"Subdirectory: {name} ({name}) ({src})\")").unwrap();
+        writeln!(out, "else()").unwrap();
+        writeln!(out, "    message(WARNING \"UniDeps: {src} defines no target called '{name}'; link against whatever its CMakeLists.txt does define\")").unwrap();
+        writeln!(out, "endif()").unwrap();
     }
 
     fn find_cmake_configs(prefix: &Path) -> Vec<String> {
@@ -508,6 +616,89 @@ endif()
 mod tests {
     use super::*;
     use unideps_core::manifest::{DependencyDetails, DependencySpec};
+
+    fn subdir_node(name: &str) -> DependencyNode {
+        let mut node = DependencyNode::from_target_dep(name, &DependencySpec::Detailed(DependencyDetails::default()));
+        node.strategy = unideps_core::graph::SUBDIRECTORY_STRATEGY.into();
+        node.subdir_source = Some(std::path::PathBuf::from("C:/work/mylib"));
+        node
+    }
+
+    #[test]
+    fn subdirectory_package_is_added_not_imported() {
+        let mut node = subdir_node("mylib");
+        node.subdir_nested_targets = Some(std::path::PathBuf::from("C:/build/unideps_mylib.cmake"));
+        node.subdir_options.insert("MYLIB_FAST".into(), "ON".into());
+
+        let content = CMakeGenerator::generate_targets_cmake(&[&node]);
+        assert!(content.contains("add_subdirectory(\"C:/work/mylib\" \"${CMAKE_CURRENT_BINARY_DIR}/_unideps/mylib\")"));
+        // The package's own unideps.toml reaches it instead of a second unideps run.
+        assert!(content.contains("set(UNIDEPS_NESTED_TARGETS \"C:/build/unideps_mylib.cmake\")"));
+        assert!(content.contains("set(MYLIB_FAST \"ON\")"));
+        assert!(content.contains("set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)"));
+        assert!(content.contains("add_library(mylib::mylib ALIAS mylib)"));
+        // Nothing is installed, so none of the find_package machinery applies.
+        assert!(!content.contains("find_package"));
+        assert!(!content.contains("list(APPEND UNIDEPS_INSTALL_PREFIXES"));
+    }
+
+    /// Whatever the consumer had under the same name is its own; the values are for the
+    /// package's configure only.
+    #[test]
+    fn values_set_for_a_subdirectory_package_are_restored() {
+        let mut node = subdir_node("mylib");
+        node.shared = Some(true);
+
+        let content = CMakeGenerator::generate_targets_cmake(&[&node]);
+        let set_at = content.find("set(BUILD_SHARED_LIBS \"ON\")").expect("value is set");
+        let add_at = content.find("add_subdirectory(").expect("subdirectory is added");
+        let restore_at = content
+            .find("set(BUILD_SHARED_LIBS \"${_unideps_save_BUILD_SHARED_LIBS}\")")
+            .expect("value is restored");
+        assert!(set_at < add_at && add_at < restore_at);
+        assert!(content.contains("unset(BUILD_SHARED_LIBS)"));
+    }
+
+    /// A value reaches the generated file as CMake code, so it has to survive being parsed
+    /// as one. A Windows path is the usual way to find out that it did not.
+    #[test]
+    fn option_values_are_escaped_for_cmake() {
+        let mut node = subdir_node("mylib");
+        node.subdir_options
+            .insert("SKIA_DIR".into(), r"C:\Users\Nelonn\Skia-Windows-Debug-x64".into());
+        node.subdir_options.insert("QUOTED".into(), r#"a "b" c"#.into());
+        node.subdir_options.insert("DOLLAR".into(), "${NOT_EXPANDED}".into());
+
+        let content = CMakeGenerator::generate_targets_cmake(&[&node]);
+        assert!(content.contains(r#"set(SKIA_DIR "C:\\Users\\Nelonn\\Skia-Windows-Debug-x64")"#), "{content}");
+        assert!(content.contains(r#"set(QUOTED "a \"b\" c")"#));
+        // The command line of a normal build would not expand it either.
+        assert!(content.contains(r#"set(DOLLAR "\${NOT_EXPANDED}")"#));
+    }
+
+    #[test]
+    fn a_version_string_is_escaped_too() {
+        let spec = DependencySpec::Detailed(DependencyDetails {
+            version: Some(r#"1.0\"weird"#.into()),
+            ..Default::default()
+        });
+        let mut node = DependencyNode::from_target_dep("w", &spec);
+        node.install_prefix = Some(std::path::PathBuf::from("C:/mock/prefix"));
+
+        let content = CMakeGenerator::generate_targets_cmake(&[&node]);
+        assert!(content.contains(r#"set(_unideps_w_ver "1.0\\\"weird")"#), "{content}");
+    }
+
+    #[test]
+    fn an_import_name_gets_its_own_alias() {
+        let mut node = subdir_node("mylib");
+        node.import_name = Some("MyLib".into());
+
+        let content = CMakeGenerator::generate_targets_cmake(&[&node]);
+        assert!(content.contains("add_library(mylib::mylib ALIAS mylib)"));
+        assert!(content.contains("add_library(MyLib::MyLib ALIAS mylib)"));
+        assert!(content.contains("add_library(MyLib ALIAS mylib)"));
+    }
 
     #[test]
     fn test_cmake_generator_find_package_mode() {

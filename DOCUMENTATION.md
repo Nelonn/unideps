@@ -93,7 +93,7 @@ Version-only specs (`fmt = "10.2.1"`) require registries, which are not supporte
 | `path` | String | Local source directory, relative to the manifest |
 | `version` | String | Informational version, also passed to recipes |
 | `shallow` | Boolean | Shallow fetch (default `true`) |
-| `strategy` | String | Build strategy. Only `"cmake-install"` (default) is supported |
+| `strategy` | String | `"cmake-install"` (default) or `"cmake-subdirectory"`, see [Build strategies](#build-strategies) |
 | `shared` | Boolean | Build shared (`true`) or static (`false`). Unset: `BUILD_SHARED_LIBS` of the consuming project, else static |
 | `header_only` | Boolean | Skip compilation and copy `include_dirs` (default `include/`) from the source into the install prefix |
 | `cmake_options` | Table | Definitions passed as `-D<KEY>=<VALUE>`. `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS` are merged with `flags`. Values may refer to variables of the consuming CMake project, see [Variables in `cmake_options`](#variables-in-cmake_options) |
@@ -112,6 +112,29 @@ Version-only specs (`fmt = "10.2.1"`) require registries, which are not supporte
 
 Setting `include_dirs`, `libraries` or `header_only` also enables `auto_import`.
 
+#### Build strategies
+
+**`cmake-install`** (default) is the normal path: UniDeps configures, builds and installs the package into its own prefix, caches it, and the consuming project imports the result.
+
+**`cmake-subdirectory`** hands the prepared sources to the consuming project instead, which adds them with `add_subdirectory`. For working on a dependency next to the project that uses it:
+
+```toml
+[dependencies.mylib]
+path = "../mylib"
+strategy = "cmake-subdirectory"
+```
+
+The package becomes part of the consumer's build tree, so editing its sources and running `cmake --build` rebuilds it like any other target of the project — no install, no cache, no UniDeps run in between. `git` sources work too (the checkout is used as the subdirectory), as do `patches`.
+
+UniDeps still owes the package everything its own `unideps.toml` asks for. Those dependencies are resolved, built and installed exactly as usual before the consumer configures, and reach the package through a generated targets file that its `unideps_setup()` includes — the same mechanism as a nested build (see [Nested manifests](#nested-manifests)), including the option probe for `enabled_if`. The package must not run `unideps` itself; `unideps_setup()` detects the situation and does the right thing.
+
+What is different from `cmake-install`:
+
+- nothing is installed, so the package has no install prefix: `${<name>.prefix}`, `<NAME>_ROOT` and `find_package` do not apply to it, and nothing is cached or archived;
+- `shared` and `cmake_options` are set as CMake variables right before the `add_subdirectory` call, and whatever the consumer had under those names is restored right after. `${NAME}` and `${<dep>.prefix}` in a value are resolved exactly as they are for a normal build; `option()` in the package honours the values (CMP0077). The `<Dep>_INCLUDE_DIR` / `<Dep>_LIBRARY` hints a normal build gets for classic Find modules are not set, only the `<Dep>_ROOT` variables and `CMAKE_PREFIX_PATH` entries that the generated file sets for every installed package anyway;
+- the consumer links `<name>::<name>`. If the package's CMakeLists.txt defines only a plain `<name>` target, UniDeps aliases it (and `<import_name>::<import_name>` as well); if it defines neither, the configure warns and you link whatever the package does define;
+- `header_only` does not apply, and a package built this way can only be used by the consuming project or by another `cmake-subdirectory` package — a package UniDeps builds on its own is configured against install prefixes, which this one has none of.
+
 #### Import modes
 
 - **`find_package` mode** (default): after building, UniDeps calls `find_package(<import_name or detected config name> CONFIG)` against the install prefix and reports the imported targets. Configure fails with a clear message if no config package is installed.
@@ -129,7 +152,7 @@ git = "https://github.com/netwide-assembler/nasm.git"
 tag = "nasm-2.16.03"
 ```
 
-Tools support `git`, `tag`, `branch`, `commit`, `path`, `version` and `strategy`. A tool can be replaced by a preinstalled one in `.local.toml` (see section 3).
+Tools support `git`, `tag`, `branch`, `commit`, `path`, `version` and `strategy`, but not `cmake-subdirectory`: a tool has to be built and run before the consumer configures, so it cannot be part of the consumer's own build. A tool can be replaced by a preinstalled one in `.local.toml` (see section 3).
 
 ### `[presets]`
 
@@ -388,20 +411,22 @@ If the source of a dependency contains a `unideps.toml`, unideps builds the depe
 - their prefixes are added to `CMAKE_PREFIX_PATH` of the dependency's build and their build ids are part of the dependency's build id;
 - the dependency's own `unideps_setup()` does **not** start `unideps`: the outer run generates a targets file for the nested dependencies and passes it as `UNIDEPS_NESTED_TARGETS`, which `unideps_setup()` includes. `MANIFEST`, `TARGET_FILE` and the other parameters are ignored in this mode;
 - `[strategy]` rules of the nested manifest apply to its dependencies; `[presets]`, `[targets]`, `[overrides]` and `.local.toml` of the nested manifest are ignored, the outer ones are used for local tools and resource limits;
-- `enabled_if` in the nested manifest refers to the options of the dependency itself: its `option()` defaults, overridden by the dependency's `cmake_options` (the options of the outer project are not used). They are only known once its CMake has run, so unideps first configures the dependency once in a scratch directory (`[PROBE]`); its `unideps_setup()` writes the options declared before it and stops the configure. The probe runs in scratch space and its result is never cached, and it is skipped if no nested dependency uses `enabled_if`. Declare the options **before** `unideps_setup()`, and keep the dependency's `cmake/unideps.cmake` up to date: an older copy cannot be probed and all `enabled_if` dependencies are treated as disabled (with a warning);
+- `enabled_if` in the nested manifest refers to the options of the dependency itself: its `option()` defaults, overridden by the dependency's `cmake_options` (the options of the outer project are not used). They are only known once its CMake has run, so unideps first configures the dependency once in a scratch directory (`[PROBE]`); its `unideps_setup()` writes the options declared before it and stops the configure. The probe runs in scratch space and its result is never cached, and it is skipped if no nested dependency uses `enabled_if` — and skipped entirely for a package that is already installed, see [Resolution Records](#resolution-records). Declare the options **before** `unideps_setup()`, and keep the dependency's `cmake/unideps.cmake` up to date: an older copy cannot be probed and all `enabled_if` dependencies are treated as disabled (with a warning);
+- a `cmake-subdirectory` dependency is treated the same way: its nested dependencies are built and installed as usual before the consumer configures, and reach it through `UNIDEPS_NESTED_TARGETS`, even though the package itself is never installed;
 - cycles between nested manifests are reported as an error;
 - only target dependencies are inspected, `[tools]` are not. `unideps fetch` follows nested manifests too.
 
-The nested manifest is found in the (patched) source, so a dependency's source has to be present even when its build is cached; an existing checkout is reused without network access.
+The nested manifest is found in the (patched) source, so resolving a dependency needs its source even when its build is cached; an existing checkout is reused without network access. The outcome is remembered, so an already installed package is not fetched again — see [Resolution Records](#resolution-records).
 
 ### Nesting guard
 
-Every CMake process started by unideps has `UNIDEPS_ACTIVE=1` in its environment. A second `unideps` started from inside would wait forever for the build lock held by the first, so `unideps` refuses to run when the variable is set. `unideps_setup()` checks it too and switches to the nested mode above.
+Every CMake process started by unideps has `UNIDEPS_ACTIVE=1` in its environment. A second `unideps` started from inside would wait forever for the package lock held by the first, so `unideps` refuses to run when the variable is set. `unideps_setup()` checks it too and switches to the nested mode above, as it also does when `UNIDEPS_NESTED_TARGETS` or `UNIDEPS_NESTED_PROBE` is set — which is how a `cmake-subdirectory` package picks up its own dependencies inside the consumer's configure instead of re-resolving them.
 
 ### Limitations
 
 - Multi-config generators (Visual Studio, Ninja Multi-Config): dependencies are built once, for `CMAKE_BUILD_TYPE` or Release. Pass `-DCMAKE_BUILD_TYPE=Debug` to get debug dependencies.
-- Dependencies themselves are always built with Ninja.
+- Dependencies themselves are always built with Ninja. A `cmake-subdirectory` dependency is the exception: it is built by the consuming project, with its generator and its configuration.
+- A `cmake-subdirectory` dependency is resolved from scratch on every configure, because its sources are the ones being worked on. With `enabled_if` in its own `unideps.toml` that includes the option probe, i.e. one extra CMake configure per run.
 
 ---
 

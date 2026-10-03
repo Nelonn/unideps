@@ -2,14 +2,14 @@ use crate::util::{resolve_relative, warn};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use unideps_core::graph::{DependencyGraph, DependencyNode, NodeKind};
+use unideps_core::graph::{DependencyGraph, DependencyNode, INSTALL_STRATEGY, NodeKind, SUBDIRECTORY_STRATEGY};
 use unideps_core::manifest::{LocalConfig, Manifest, TargetSysrootConfig};
 use unideps_core::strategy::StrategyEngine;
 use unideps_core::target::TargetTriple;
 use unideps_recipe::engine::LuaRecipeEngine;
 use unideps_recipe::recipe::Recipe;
 
-pub const SUPPORTED_STRATEGIES: &[&str] = &["cmake-install"];
+pub const SUPPORTED_STRATEGIES: &[&str] = &[INSTALL_STRATEGY, SUBDIRECTORY_STRATEGY];
 
 pub struct Project {
     pub manifest_dir: PathBuf,
@@ -228,6 +228,24 @@ fn validate_source(node: &DependencyNode) -> Result<()> {
             node.strategy,
             SUPPORTED_STRATEGIES.join(", ")
         );
+    }
+    if node.is_subdirectory() {
+        if node.header_only {
+            anyhow::bail!(
+                "'{}' is `header_only` and `strategy = \"{SUBDIRECTORY_STRATEGY}\"` at once, but a \
+                 package the consumer adds with add_subdirectory is built from its CMakeLists.txt. \
+                 Drop one of the two",
+                node.name
+            );
+        }
+        if node.kind == NodeKind::HostTool {
+            anyhow::bail!(
+                "tool '{}' uses `strategy = \"{SUBDIRECTORY_STRATEGY}\"`, which only applies to \
+                 dependencies: a tool is built and run before the consumer configures, so it \
+                 cannot be part of the consumer's own build",
+                node.name
+            );
+        }
     }
     Ok(())
 }

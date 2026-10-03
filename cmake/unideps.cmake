@@ -118,8 +118,10 @@ macro(_unideps_collect_options)
     endforeach()
 endmacro()
 
-# Inside a package that is being built by unideps itself (UNIDEPS_ACTIVE is exported to
-# every CMake process unideps starts) running `unideps` again would wait forever for the
+# Inside a package whose dependencies someone else has already built -- because unideps is
+# building it (UNIDEPS_ACTIVE is exported to every CMake process unideps starts), or because
+# the consuming project added it with add_subdirectory under `strategy = "cmake-subdirectory"`
+# -- running `unideps` again would at best redo that work and at worst wait forever for the
 # build lock. The outer run builds the dependencies of the package's own unideps.toml
 # beforehand, in two steps:
 #  1. a probe configure (UNIDEPS_NESTED_PROBE=<file>): the options the package has
@@ -135,7 +137,7 @@ macro(_unideps_setup_nested)
         message(FATAL_ERROR "UniDeps: options written to ${UNIDEPS_NESTED_PROBE}; this configure run only "
                             "probes them and is expected to stop here")
     elseif(UNIDEPS_NESTED_TARGETS AND EXISTS "${UNIDEPS_NESTED_TARGETS}")
-        message(STATUS "UniDeps: building inside another unideps run, using ${UNIDEPS_NESTED_TARGETS}")
+        message(STATUS "UniDeps: dependencies already built by the outer run, using ${UNIDEPS_NESTED_TARGETS}")
         include("${UNIDEPS_NESTED_TARGETS}")
     else()
         message(WARNING "UniDeps: unideps_setup() skipped: this project is built by unideps, but it has no "
@@ -333,7 +335,11 @@ macro(unideps_setup)
         set(_UNIDEPS_BASE_DIR "${UNIDEPS_BASE_DIR}")
     endif()
 
-    if(DEFINED ENV{UNIDEPS_ACTIVE})
+    # Running unideps here would be wrong twice over: inside a build it started itself it
+    # would wait forever for its own lock, and inside the configure of a project that added
+    # this package with add_subdirectory it would re-resolve what that project just resolved.
+    # Either way the dependencies are already built and UNIDEPS_NESTED_TARGETS names them.
+    if(DEFINED ENV{UNIDEPS_ACTIVE} OR UNIDEPS_NESTED_TARGETS OR UNIDEPS_NESTED_PROBE)
         _unideps_setup_nested()
     else()
         _unideps_setup_build()

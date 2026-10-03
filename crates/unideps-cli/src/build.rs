@@ -13,7 +13,7 @@ use unideps_builder::storage::StorageManager;
 use unideps_cache::packager::Packager;
 use unideps_cmake::generator::CMakeGenerator;
 use unideps_core::compiler::CompilerType;
-use unideps_core::graph::{DependencyGraph, DependencyNode, Direction, NodeIndex, NodeKind};
+use unideps_core::graph::{DependencyGraph, DependencyNode, Direction, NodeIndex, NodeKind, SUBDIRECTORY_STRATEGY};
 use unideps_core::hash::HashCalculator;
 use unideps_core::manifest::Preset;
 use unideps_core::strategy::{EffectiveConfig, StrategyEngine};
@@ -98,6 +98,8 @@ struct BuildContext<'a> {
     storage: &'a StorageManager,
     /// Shared for the whole run so that a checkout is brought up to date only once.
     sources: &'a Sources<'a>,
+    /// Where the generated targets file goes, i.e. the consumer's build tree.
+    targets_dir: PathBuf,
     c_compiler: Option<PathBuf>,
     cxx_compiler: Option<PathBuf>,
     toolchain_file: Option<PathBuf>,
@@ -131,6 +133,7 @@ impl<'a> BuildContext<'a> {
             strategy,
             storage: self.storage,
             sources: self.sources,
+            targets_dir: self.targets_dir.clone(),
             c_compiler: self.c_compiler.clone(),
             cxx_compiler: self.cxx_compiler.clone(),
             toolchain_file: self.toolchain_file.clone(),
@@ -324,6 +327,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     let storage = StorageManager::new(project.base_dir(args.base_dir.as_deref())).with_scratch_dir(project.scratch_dir());
 
+    // Known before the build because a `cmake-subdirectory` package puts its own generated
+    // include file next to this one, in the consumer's build tree where it belongs.
+    let cmake_path = match args.generate_targets.clone() {
+        Some(out_file) => out_file,
+        None => storage.installed_dir().join("unideps.cmake"),
+    };
+    let targets_dir = cmake_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
     let sources = Sources::new(&storage);
     let ctx = BuildContext {
         project: &project,
@@ -333,6 +344,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         strategy: StrategyEngine::new(&m.strategy),
         storage: &storage,
         sources: &sources,
+        targets_dir,
         c_compiler,
         cxx_compiler,
         toolchain_file,
@@ -347,6 +359,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     preflight(&ctx, &graph)?;
 
     storage.ensure_dirs()?;
+    std::fs::create_dir_all(&ctx.targets_dir)?;
     println!("Storage: {}", storage.base_dir().display());
     // This shared lock keeps `unideps clean` out. A separate exclusive lock limits
     // actual package builds to one at a time across all runs using this storage.
@@ -359,15 +372,6 @@ pub fn run(args: BuildArgs) -> Result<()> {
         .filter(|n| n.kind == NodeKind::TargetDependency)
         .collect();
     let cmake_content = CMakeGenerator::generate_targets_cmake(&refs);
-    let cmake_path = match args.generate_targets {
-        Some(out_file) => {
-            if let Some(parent) = out_file.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            out_file
-        }
-        None => ctx.storage.installed_dir().join("unideps.cmake"),
-    };
     std::fs::write(&cmake_path, cmake_content)?;
 
     println!("UniDeps successfully prepared environment: {}", cmake_path.display());
@@ -388,6 +392,29 @@ fn preflight(ctx: &BuildContext, graph: &DependencyGraph) -> Result<()> {
             .collect();
         if let Err(e) = ctx.configure_node(&mut node, &dependents) {
             errors.push(format!("{e:#}"));
+        }
+        // A package unideps builds on its own is configured against install prefixes, and a
+        // `cmake-subdirectory` package has none: it only exists inside the consumer's build.
+        if node.is_subdirectory() {
+            let outside: Vec<&str> = graph
+                .reachable(idx, Direction::Incoming)
+                .into_iter()
+                .filter(|&i| !graph.graph[i].is_subdirectory())
+                .map(|i| graph.graph[i].name.as_str())
+                .collect();
+            if !outside.is_empty() {
+                errors.push(format!(
+                    "'{}' uses `strategy = \"{SUBDIRECTORY_STRATEGY}\"`, so it is only built as part of \
+                     the consuming project, but {} depend{} on it and {} built separately. Give {} the \
+                     same strategy, or build '{}' the normal way",
+                    node.name,
+                    outside.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", "),
+                    if outside.len() == 1 { "s" } else { "" },
+                    if outside.len() == 1 { "is" } else { "are" },
+                    if outside.len() == 1 { "it" } else { "them" },
+                    node.name,
+                ));
+            }
         }
     }
     if !errors.is_empty() {
@@ -565,6 +592,63 @@ fn ordered_dependencies(graph: &DependencyGraph, idx: NodeIndex) -> Vec<NodeInde
     deps
 }
 
+/// A `cmake-subdirectory` package is not built here: its sources are handed to the
+/// consumer, whose CMake adds them with `add_subdirectory`. What unideps still owes it is
+/// everything its own `unideps.toml` asks for -- those packages are built and installed as
+/// usual (above this call) and reach it through a targets file its `unideps_setup()`
+/// includes, exactly as in a nested build.
+fn subdirectory(
+    ctx: &BuildContext,
+    mut node: DependencyNode,
+    dep_nodes: &[&DependencyNode],
+    src_dir: &Path,
+    build_id: &str,
+    nested: Option<&Nested>,
+) -> Result<DependencyNode> {
+    if !src_dir.join("CMakeLists.txt").is_file() {
+        anyhow::bail!(
+            "'{}' uses `strategy = \"{SUBDIRECTORY_STRATEGY}\"`, but there is no CMakeLists.txt in {}",
+            node.name,
+            src_dir.display()
+        );
+    }
+    if let Some(nested) = nested {
+        // Beside the consumer's own generated file: it is regenerated on every configure and
+        // goes away with the build tree, like the build it belongs to.
+        let file = ctx
+            .targets_dir
+            .join(format!("unideps_{}_{build_id}.cmake", node.name));
+        std::fs::write(&file, &nested.targets_cmake)
+            .with_context(|| format!("Failed to write the nested targets file of '{}'", node.name))?;
+        node.subdir_nested_targets = Some(std::path::absolute(&file)?);
+    }
+    // The same values a normal build would get on its configure command line, resolved the
+    // same way: the consumer sets them around `add_subdirectory` instead.
+    node.subdir_options = cmake_definitions(&node, dep_nodes)?;
+
+    println!("[SUBDIR] {} ({})", node.name, src_dir.display());
+    node.subdir_source = Some(std::path::absolute(src_dir)?);
+    Ok(node)
+}
+
+/// `cmake_options` of the node and of its strategy rules, with `${<dep>.prefix}` replaced
+/// by the install prefix of a package built before it.
+fn cmake_definitions(node: &DependencyNode, dep_nodes: &[&DependencyNode]) -> Result<BTreeMap<String, String>> {
+    let mut definitions = node.cmake_options.clone();
+    for (k, v) in &node.config.cmake_options {
+        definitions.insert(k.clone(), v.clone());
+    }
+    let prefix_of = |name: &str| {
+        let dep = dep_nodes.iter().find(|d| d.name == name)?;
+        Some(dep.install_prefix.as_ref()?.to_string_lossy().replace('\\', "/"))
+    };
+    for (key, value) in definitions.iter_mut() {
+        *value = expand_dep_refs(value, &prefix_of)
+            .with_context(|| format!("In cmake_options.{key} of '{}'", node.name))?;
+    }
+    Ok(definitions)
+}
+
 fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack: &mut NestedStack) -> Result<Built> {
     let deps = ordered_dependencies(graph, idx);
     let dependents: Vec<&str> = graph
@@ -602,7 +686,11 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
     // package a cache hit before its source is fetched and, for a package with a nested
     // manifest, before it is configured once just to read its options back out.
     let plain_id = HashCalculator::calculate_build_id(&node, &ctx.target, &ctx.host, &dep_build_ids);
-    if let Some(resolution) = Resolution::load(ctx.storage, &node.name, &plain_id) {
+    // Nothing of a `cmake-subdirectory` package is installed, so there is no prefix to find
+    // and nothing to remember: the point of it is that its sources are being worked on.
+    if !node.is_subdirectory()
+        && let Some(resolution) = Resolution::load(ctx.storage, &node.name, &plain_id)
+    {
         println!("[CACHE HIT] {} ({})", node.name, resolution.build_id);
         node.install_prefix = Some(
             ctx.storage
@@ -624,6 +712,14 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
     dep_build_ids.extend(nested_nodes.iter().filter_map(|n| n.build_id.as_deref()));
     let build_id = HashCalculator::calculate_build_id(&node, &ctx.target, &ctx.host, &dep_build_ids);
     node.build_id = Some(build_id.clone());
+
+    if node.is_subdirectory() {
+        let dep_nodes: Vec<&DependencyNode> = direct_deps.iter().copied().chain(nested_nodes).collect();
+        return subdirectory(ctx, node, &dep_nodes, &src_dir, &build_id, nested.as_ref()).map(|node| Built {
+            node,
+            nested: nested_nodes.to_vec(),
+        });
+    }
 
     let dir_name = format!("{}-{build_id}", node.name);
     let install_dir = ctx.storage.installed_dir().join(&dir_name);
@@ -765,18 +861,7 @@ fn run_cmake(
         }
     }
 
-    let mut definitions = node.cmake_options.clone();
-    for (k, v) in &node.config.cmake_options {
-        definitions.insert(k.clone(), v.clone());
-    }
-    let prefix_of = |name: &str| {
-        let dep = dep_nodes.iter().find(|d| d.name == name)?;
-        Some(dep.install_prefix.as_ref()?.to_string_lossy().replace('\\', "/"))
-    };
-    for (key, value) in definitions.iter_mut() {
-        *value = expand_dep_refs(value, &prefix_of)
-            .with_context(|| format!("In cmake_options.{key} of '{}'", node.name))?;
-    }
+    let mut definitions = cmake_definitions(node, &dep_nodes)?;
     for d in dep_nodes.iter().filter(|d| d.kind == NodeKind::TargetDependency) {
         for (k, v) in dep_root_vars(d) {
             definitions.entry(k).or_insert(v);
@@ -953,6 +1038,31 @@ mod tests {
         let mut n = DependencyNode::from_target_dep(name, &DependencySpec::Detailed(DependencyDetails::default()));
         n.install_prefix = Some(PathBuf::from(prefix));
         n
+    }
+
+    /// A `cmake-subdirectory` package never runs its own configure, so the values the
+    /// consumer sets around `add_subdirectory` have to be resolved the same way here.
+    #[test]
+    fn cmake_options_resolve_dependency_prefixes() {
+        let dep = node("hdr", "C:/store/installed/hdr-1");
+        let mut consumer = node("mylib", "");
+        consumer.cmake_options.insert("EXTRA_DIR".into(), "${hdr.prefix}/include".into());
+        consumer.config.cmake_options.insert("FROM_RULE".into(), "${hdr.prefix}".into());
+        consumer.cmake_options.insert("PLAIN".into(), "ON".into());
+
+        let defs = cmake_definitions(&consumer, &[&dep]).unwrap();
+        assert_eq!(defs["EXTRA_DIR"], "C:/store/installed/hdr-1/include");
+        assert_eq!(defs["FROM_RULE"], "C:/store/installed/hdr-1");
+        assert_eq!(defs["PLAIN"], "ON");
+    }
+
+    #[test]
+    fn cmake_options_reject_a_package_that_is_not_a_dependency() {
+        let mut consumer = node("mylib", "");
+        consumer.cmake_options.insert("X".into(), "${nope.prefix}".into());
+
+        let err = cmake_definitions(&consumer, &[]).unwrap_err().to_string();
+        assert!(err.contains("cmake_options.X of 'mylib'"), "{err}");
     }
 
     fn names(nodes: &[DependencyNode]) -> Vec<(&str, &str)> {

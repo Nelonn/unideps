@@ -10,6 +10,16 @@ pub use petgraph::graph::NodeIndex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 
+/// Builds the package and installs it to its own prefix, which the consumer then finds
+/// with `find_package`. The default.
+pub const INSTALL_STRATEGY: &str = "cmake-install";
+
+/// Hands the package's sources to the consumer's own CMake, which adds them with
+/// `add_subdirectory`, instead of building and installing it. For working on a dependency
+/// next to the project that uses it: nothing is cached, and an edit to its sources is a
+/// rebuild of the consumer like any other.
+pub const SUBDIRECTORY_STRATEGY: &str = "cmake-subdirectory";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
     TargetDependency,
@@ -59,6 +69,19 @@ pub struct DependencyNode {
     /// Commit a branch / default HEAD resolved to; branch names alone would never invalidate the cache.
     pub resolved_commit: Option<String>,
     pub toolchain_fingerprint: Option<String>,
+    /// `cmake-subdirectory` only: the prepared source tree the consumer adds. Set instead
+    /// of `install_prefix`, which such a package never gets -- it is never installed.
+    #[serde(default)]
+    pub subdir_source: Option<PathBuf>,
+    /// `cmake-subdirectory` only: the targets file for what the package's own
+    /// `unideps.toml` pulled in, which its `unideps_setup()` includes.
+    #[serde(default)]
+    pub subdir_nested_targets: Option<PathBuf>,
+    /// `cmake-subdirectory` only: `cmake_options` as the consumer is to set them around
+    /// `add_subdirectory`, with `${<dep>.prefix}` already resolved. A package built the
+    /// normal way gets the same values on the command line of its own configure.
+    #[serde(default)]
+    pub subdir_options: BTreeMap<String, String>,
 }
 
 impl DependencyNode {
@@ -74,7 +97,7 @@ impl DependencyNode {
             commit: d.commit,
             path: d.path,
             shallow: d.shallow.unwrap_or(true),
-            strategy: d.strategy.unwrap_or_else(|| "cmake-install".into()),
+            strategy: d.strategy.unwrap_or_else(|| INSTALL_STRATEGY.into()),
             shared: d.shared,
             header_only: d.header_only.unwrap_or(false),
             cmake_options: d.cmake_options,
@@ -96,6 +119,9 @@ impl DependencyNode {
             patches: d.patches,
             resolved_commit: None,
             toolchain_fingerprint: None,
+            subdir_source: None,
+            subdir_nested_targets: None,
+            subdir_options: BTreeMap::new(),
         }
     }
 
@@ -164,6 +190,11 @@ impl DependencyNode {
         }
     }
 
+    /// Whether the consumer's own CMake builds this package with `add_subdirectory`.
+    pub fn is_subdirectory(&self) -> bool {
+        self.strategy == SUBDIRECTORY_STRATEGY
+    }
+
     pub fn from_host_tool(name: &str, req: &ToolRequirement) -> Self {
         let d = req.to_details();
         Self {
@@ -176,7 +207,7 @@ impl DependencyNode {
             commit: d.commit,
             path: d.path,
             shallow: true,
-            strategy: d.strategy.unwrap_or_else(|| "cmake-install".into()),
+            strategy: d.strategy.unwrap_or_else(|| INSTALL_STRATEGY.into()),
             shared: Some(false),
             header_only: false,
             cmake_options: BTreeMap::new(),
@@ -198,6 +229,9 @@ impl DependencyNode {
             patches: Vec::new(),
             resolved_commit: None,
             toolchain_fingerprint: None,
+            subdir_source: None,
+            subdir_nested_targets: None,
+            subdir_options: BTreeMap::new(),
         }
     }
 }
