@@ -26,6 +26,64 @@ fn quote(value: &str) -> String {
     out
 }
 
+/// Emitted once, ahead of the `add_subdirectory` calls, when the manifest has a
+/// `cmake-subdirectory` dependency.
+const SUBDIR_HELPERS: &str = r#"
+function(_unideps_has_prefix str prefix out_var)
+    string(LENGTH "${prefix}" _unideps_prefix_len)
+    string(LENGTH "${str}" _unideps_str_len)
+    if(_unideps_str_len LESS _unideps_prefix_len)
+        set(${out_var} FALSE PARENT_SCOPE)
+        return()
+    endif()
+    string(SUBSTRING "${str}" 0 ${_unideps_prefix_len} _unideps_head)
+    if(_unideps_head STREQUAL "${prefix}")
+        set(${out_var} TRUE PARENT_SCOPE)
+    else()
+        set(${out_var} FALSE PARENT_SCOPE)
+    endif()
+endfunction()
+
+# A package added with add_subdirectory defines its targets in its own directory scope and
+# in those of its subdirectories, not in the scope that added it, so BUILDSYSTEM_TARGETS of
+# the current directory does not see them -- hence the walk. Collects the library targets the
+# package exports as `<ns>::<target>`, aliasing the ones it left unaliased, so that a
+# multi-target package is linked under the same names a cmake-install build of it would give
+# the consumer. Targets that are not the package's own (its vendored third-party
+# subdirectories) keep to themselves: they neither carry an `<ns>::` alias nor start with
+# `<ns>`, so they are left alone.
+function(_unideps_subdir_exports dir ns out_var)
+    set(_unideps_exports "")
+    set(_unideps_pending "${dir}")
+    while(_unideps_pending)
+        list(POP_FRONT _unideps_pending _unideps_dir)
+        get_property(_unideps_subs DIRECTORY "${_unideps_dir}" PROPERTY SUBDIRECTORIES)
+        list(APPEND _unideps_pending ${_unideps_subs})
+        get_property(_unideps_dir_targets DIRECTORY "${_unideps_dir}" PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(_unideps_t IN LISTS _unideps_dir_targets)
+            get_target_property(_unideps_t_type ${_unideps_t} TYPE)
+            if(_unideps_t_type STREQUAL "EXECUTABLE" OR _unideps_t_type STREQUAL "UTILITY")
+                continue()
+            endif()
+            if(TARGET ${ns}::${_unideps_t})
+                list(APPEND _unideps_exports "${ns}::${_unideps_t}")
+            else()
+                _unideps_has_prefix("${_unideps_t}" "${ns}" _unideps_owned)
+                if(_unideps_owned)
+                    add_library(${ns}::${_unideps_t} ALIAS ${_unideps_t})
+                    list(APPEND _unideps_exports "${ns}::${_unideps_t}")
+                endif()
+            endif()
+        endforeach()
+    endwhile()
+    if(_unideps_exports)
+        list(REMOVE_DUPLICATES _unideps_exports)
+        list(SORT _unideps_exports)
+    endif()
+    set(${out_var} "${_unideps_exports}" PARENT_SCOPE)
+endfunction()
+"#;
+
 impl CMakeGenerator {
     pub fn generate_targets_cmake(nodes: &[&DependencyNode]) -> String {
         let mut out = String::new();
@@ -37,6 +95,7 @@ impl CMakeGenerator {
             // So that the `option()` calls of a package added with add_subdirectory honour the
             // values set for it below instead of resetting them to their own defaults.
             writeln!(&mut out, "set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)").unwrap();
+            writeln!(&mut out, "{SUBDIR_HELPERS}").unwrap();
         }
         writeln!(&mut out).unwrap();
 
@@ -382,7 +441,11 @@ endif()
             set_before.push((k.clone(), v.clone()));
         }
 
-        writeln!(out, "if(NOT TARGET {name} AND NOT TARGET {name}::{name})").unwrap();
+        // Set by the block below once the sources have been added, so that a second
+        // include of this file -- or another project in the same build tree depending on
+        // the same package -- does not add the same source directory twice.
+        writeln!(out, "get_property(_unideps_{name}_subdir_added GLOBAL PROPERTY _unideps_subdir_{name})").unwrap();
+        writeln!(out, "if(NOT _unideps_{name}_subdir_added AND NOT TARGET {name} AND NOT TARGET {name}::{name})").unwrap();
         // The values belong to this package's configure, not to the rest of the consumer's,
         // so whatever the consumer had is put back afterwards.
         for (k, v) in &set_before {
@@ -405,6 +468,8 @@ endif()
             writeln!(out, "        unset({k})").unwrap();
             writeln!(out, "    endif()").unwrap();
         }
+        writeln!(out, "    set_property(GLOBAL PROPERTY _unideps_subdir_{name} TRUE)").unwrap();
+        writeln!(out, "    set(_unideps_{name}_subdir_added TRUE)").unwrap();
         writeln!(out, "endif()").unwrap();
 
         // The package names its own targets; `<name>::<name>` is what the consumer expects,
@@ -425,13 +490,34 @@ endif()
             writeln!(out, "endif()").unwrap();
         }
 
+        // A package that is more than one library -- `<name>_core`, `<name>_engine`, ... --
+        // has no target called `<name>` to alias, and is linked under the names it exports
+        // itself. Those are what the consumer wants reported, so look them up; the
+        // directory properties they come from only exist for sources this file added.
+        let mut namespaces: Vec<&str> = vec![name.as_str()];
+        if let Some(ref imp) = node.import_name
+            && imp != name
+        {
+            namespaces.push(imp.as_str());
+        }
+        writeln!(out, "set(_unideps_{name}_exports \"\")").unwrap();
+        writeln!(out, "if(_unideps_{name}_subdir_added)").unwrap();
+        for ns in &namespaces {
+            writeln!(out, "    _unideps_subdir_exports(\"{src}\" \"{ns}\" _unideps_{name}_{ns}_exports)").unwrap();
+            writeln!(out, "    list(APPEND _unideps_{name}_exports ${{_unideps_{name}_{ns}_exports}})").unwrap();
+        }
+        writeln!(out, "endif()").unwrap();
+
         let expected = aliases.first().cloned().unwrap_or_default();
         writeln!(out, "if(TARGET {expected})").unwrap();
         writeln!(out, "    message(STATUS \"Subdirectory: {name} ({expected}) ({src})\")").unwrap();
         writeln!(out, "elseif(TARGET {name})").unwrap();
         writeln!(out, "    message(STATUS \"Subdirectory: {name} ({name}) ({src})\")").unwrap();
+        writeln!(out, "elseif(_unideps_{name}_exports)").unwrap();
+        writeln!(out, "    string(REPLACE \";\" \", \" _unideps_{name}_exports_str \"${{_unideps_{name}_exports}}\")").unwrap();
+        writeln!(out, "    message(STATUS \"Subdirectory: {name} (${{_unideps_{name}_exports_str}}) ({src})\")").unwrap();
         writeln!(out, "else()").unwrap();
-        writeln!(out, "    message(WARNING \"UniDeps: {src} defines no target called '{name}'; link against whatever its CMakeLists.txt does define\")").unwrap();
+        writeln!(out, "    message(WARNING \"UniDeps: {src} defines no target called '{name}' and none under '{name}::'; link against whatever its CMakeLists.txt does define\")").unwrap();
         writeln!(out, "endif()").unwrap();
     }
 
@@ -687,6 +773,51 @@ mod tests {
 
         let content = CMakeGenerator::generate_targets_cmake(&[&node]);
         assert!(content.contains(r#"set(_unideps_w_ver "1.0\\\"weird")"#), "{content}");
+    }
+
+    /// A package that is several libraries -- `<name>_core`, `<name>_engine`, ... -- has no
+    /// target called `<name>`, and warning that it defines none is no help. The targets it
+    /// does define are looked up and reported instead, and only a package that defines
+    /// nothing recognisable is still warned about.
+    #[test]
+    fn a_multi_target_subdirectory_package_reports_what_it_defines() {
+        let node = subdir_node("mylib");
+        let content = CMakeGenerator::generate_targets_cmake(&[&node]);
+        assert!(content.contains("function(_unideps_subdir_exports dir ns out_var)"));
+        assert!(content.contains("_unideps_subdir_exports(\"C:/work/mylib\" \"mylib\" _unideps_mylib_mylib_exports)"));
+        // Reported only when there is neither `mylib::mylib` nor `mylib` to name.
+        let exports_at = content.find("elseif(_unideps_mylib_exports)").expect("exports branch");
+        let warn_at = content.find("message(WARNING").expect("warning branch");
+        assert!(exports_at < warn_at);
+        assert!(content.contains("defines no target called 'mylib' and none under 'mylib::'"));
+    }
+
+    /// The same source directory must not be added twice, and a multi-target package has no
+    /// `<name>` target for the guard on the `add_subdirectory` call to notice.
+    #[test]
+    fn a_subdirectory_package_is_added_only_once() {
+        let node = subdir_node("mylib");
+        let content = CMakeGenerator::generate_targets_cmake(&[&node]);
+        let guard_at = content
+            .find("if(NOT _unideps_mylib_subdir_added AND NOT TARGET mylib AND NOT TARGET mylib::mylib)")
+            .expect("guarded");
+        let add_at = content.find("add_subdirectory(").expect("subdirectory is added");
+        let mark_at = content
+            .find("set_property(GLOBAL PROPERTY _unideps_subdir_mylib TRUE)")
+            .expect("marked as added");
+        assert!(guard_at < add_at && add_at < mark_at);
+    }
+
+    /// The exports of a package with an `import_name` are looked up under both names, the way
+    /// its aliases are created under both.
+    #[test]
+    fn an_import_name_gets_its_exports_looked_up_too() {
+        let mut node = subdir_node("mylib");
+        node.import_name = Some("MyLib".into());
+
+        let content = CMakeGenerator::generate_targets_cmake(&[&node]);
+        assert!(content.contains("_unideps_subdir_exports(\"C:/work/mylib\" \"mylib\" _unideps_mylib_mylib_exports)"));
+        assert!(content.contains("_unideps_subdir_exports(\"C:/work/mylib\" \"MyLib\" _unideps_mylib_MyLib_exports)"));
     }
 
     #[test]
