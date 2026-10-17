@@ -62,6 +62,14 @@ pub struct BuildArgs {
     #[arg(long, allow_hyphen_values = true)]
     pub cmake_args: Vec<String>,
 
+    /// Extra C compiler flags, appended for every dependency this run builds (space-separated)
+    #[arg(long, allow_hyphen_values = true)]
+    pub c_flags: Option<String>,
+
+    /// Extra C++ compiler flags, appended for every dependency this run builds (space-separated)
+    #[arg(long, allow_hyphen_values = true)]
+    pub cxx_flags: Option<String>,
+
     /// Where to write the generated CMake targets file
     #[arg(long)]
     pub generate_targets: Option<PathBuf>,
@@ -278,6 +286,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if p.cxx_stdlib_package.is_some() {
             warn("presets: cxx_stdlib_package is not supported yet and is ignored");
         }
+    }
+    if let Some(ref f) = args.c_flags {
+        target_base.add_c_flags(&f.split_whitespace().map(String::from).collect::<Vec<_>>());
+    }
+    if let Some(ref f) = args.cxx_flags {
+        target_base.add_cxx_flags(&f.split_whitespace().map(String::from).collect::<Vec<_>>());
     }
     target_base.vc_runtime = if let Some(ref raw) = args.msvc_runtime {
         resolve_msvc_runtime(raw, build_type).context("Invalid --msvc-runtime")?
@@ -901,6 +915,8 @@ fn run_cmake(
         host_tools_bins: &host_tools_bins,
         log_dir: Some(&log_dir),
         flags: &node.config.flags,
+        c_flags: &node.config.c_flags,
+        cxx_flags: &node.config.cxx_flags,
         cxx_std: &node.config.cxx_std,
         cxx_stdlib: node.config.cxx_stdlib,
         lto: node.config.lto,

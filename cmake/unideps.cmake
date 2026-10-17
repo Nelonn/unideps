@@ -264,6 +264,16 @@ macro(_unideps_setup_build)
         list(APPEND _unideps_cmd --toolchain-file "${CMAKE_TOOLCHAIN_FILE}")
     endif()
 
+    # Opt-in, explicit escape hatch: unlike CMAKE_C_FLAGS/CMAKE_CXX_FLAGS (deliberately NOT
+    # forwarded, see _unideps_collect_options below), these are only sent when the consuming
+    # project sets them itself -- e.g. only inside its production/release configuration.
+    if(DEFINED UNIDEPS_C_FLAGS AND NOT UNIDEPS_C_FLAGS STREQUAL "")
+        list(APPEND _unideps_cmd --c-flags "${UNIDEPS_C_FLAGS}")
+    endif()
+    if(DEFINED UNIDEPS_CXX_FLAGS AND NOT UNIDEPS_CXX_FLAGS STREQUAL "")
+        list(APPEND _unideps_cmd --cxx-flags "${UNIDEPS_CXX_FLAGS}")
+    endif()
+
     foreach(_unideps_var ANDROID_ABI ANDROID_PLATFORM ANDROID_NDK ANDROID_STL CMAKE_ANDROID_ARCH_ABI)
         if(DEFINED ${_unideps_var} AND NOT "${${_unideps_var}}" STREQUAL "")
             list(APPEND _unideps_cmd "--cmake-args=-D${_unideps_var}=${${_unideps_var}}")

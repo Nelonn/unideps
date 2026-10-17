@@ -28,6 +28,10 @@ pub struct CMakeBuild<'a> {
     pub host_tools_bins: &'a [PathBuf],
     pub log_dir: Option<&'a Path>,
     pub flags: &'a [String],
+    /// Extra C-only flags (`--c-flags` / `UNIDEPS_C_FLAGS` of the consuming project).
+    pub c_flags: &'a [String],
+    /// Extra C++-only flags (`--cxx-flags` / `UNIDEPS_CXX_FLAGS` of the consuming project).
+    pub cxx_flags: &'a [String],
     pub cxx_std: &'a str,
     pub cxx_stdlib: CxxStdlib,
     pub lto: bool,
@@ -142,6 +146,8 @@ impl CMakeRunner {
         let mut cxx_flags: Vec<String> = b.definitions.get("CMAKE_CXX_FLAGS").into_iter().cloned().collect();
         c_flags.extend(b.flags.iter().cloned());
         cxx_flags.extend(b.flags.iter().cloned());
+        c_flags.extend(b.c_flags.iter().cloned());
+        cxx_flags.extend(b.cxx_flags.iter().cloned());
         match b.cxx_stdlib {
             CxxStdlib::Libcxx => cxx_flags.push("-stdlib=libc++".into()),
             CxxStdlib::Libstdcxx => cxx_flags.push("-stdlib=libstdc++".into()),
@@ -501,6 +507,8 @@ mod tests {
             host_tools_bins: &[],
             log_dir: None,
             flags,
+            c_flags: &[],
+            cxx_flags: &[],
             cxx_std: "",
             cxx_stdlib: CxxStdlib::PlatformDefault,
             lto: false,
@@ -530,6 +538,20 @@ mod tests {
         assert!(args.contains(&"-DCMAKE_C_FLAGS=-O2".to_string()));
         assert!(args.contains(&"-DCMAKE_CXX_FLAGS=-DUSER -O2 -stdlib=libc++".to_string()));
         assert_eq!(args.iter().filter(|a| a.starts_with("-DCMAKE_CXX_FLAGS=")).count(), 1);
+    }
+
+    #[test]
+    fn test_c_flags_and_cxx_flags_are_kept_separate() {
+        let defs = BTreeMap::new();
+        let flags = vec![];
+        let mut b = opts(&defs, &flags);
+        let c_only = vec!["-DC_ONLY".to_string()];
+        let cxx_only = vec!["-DCXX_ONLY".to_string()];
+        b.c_flags = &c_only;
+        b.cxx_flags = &cxx_only;
+        let args = args_of(&b);
+        assert!(args.contains(&"-DCMAKE_C_FLAGS=-DC_ONLY".to_string()));
+        assert!(args.contains(&"-DCMAKE_CXX_FLAGS=-DCXX_ONLY".to_string()));
     }
 
     #[test]

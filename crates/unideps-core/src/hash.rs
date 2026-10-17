@@ -191,6 +191,16 @@ impl HashCalculator {
             hasher.update(flag.as_bytes());
         }
 
+        for flag in &node.config.c_flags {
+            hasher.update(b":c_flag:");
+            hasher.update(flag.as_bytes());
+        }
+
+        for flag in &node.config.cxx_flags {
+            hasher.update(b":cxx_flag:");
+            hasher.update(flag.as_bytes());
+        }
+
         for (k, v) in &node.config.cmake_options {
             hasher.update(b":cmake_opt:");
             hasher.update(k.as_bytes());

@@ -357,6 +357,26 @@ The `unideps` executable is looked up on `PATH` and next to the module (`../targ
 - `ANDROID_ABI`, `ANDROID_PLATFORM`, `ANDROID_NDK`, `ANDROID_STL`, `CMAKE_ANDROID_ARCH_ABI`;
 - cache options (`option()`, `-D`) and boolean variables, for `enabled_if`.
 
+`CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS` of the consuming project are deliberately **not** forwarded:
+a dependency build picking up arbitrary flags from whatever configured the top-level project
+would be a silent, hard-to-reproduce ABI/behavior change. Set `UNIDEPS_C_FLAGS` /
+`UNIDEPS_CXX_FLAGS` before `unideps_setup()` instead, as an explicit opt-in — e.g. only inside a
+production/release configuration:
+
+```cmake
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(UNIDEPS_CXX_FLAGS "-march=native -flto")
+endif()
+include(cmake/unideps.cmake)
+unideps_setup()
+```
+
+These apply to every `cmake-install` dependency this run builds, on top of whatever
+`unideps.toml`'s own `flags`/`cmake_options` already set, and are part of `build_id`, so
+changing them triggers a rebuild. `cmake-subdirectory` dependencies need no such option: they
+are compiled as part of the consumer's own CMake configure, so `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS`
+set there already apply to them directly.
+
 Editing `unideps.toml` re-runs CMake configure automatically.
 
 ### Runtime libraries

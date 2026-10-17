@@ -13,6 +13,11 @@ pub struct EffectiveConfig {
     pub cxx_stdlib: CxxStdlib,
     pub lto: bool,
     pub flags: Vec<String>,
+    /// Extra C-only flags, from `--c-flags` / `UNIDEPS_C_FLAGS` of the consuming project.
+    /// Not settable from the manifest: a global, CLI-level opt-in, unlike `flags`.
+    pub c_flags: Vec<String>,
+    /// Extra C++-only flags, from `--cxx-flags` / `UNIDEPS_CXX_FLAGS` of the consuming project.
+    pub cxx_flags: Vec<String>,
     pub cmake_options: BTreeMap<String, String>,
 }
 
@@ -26,6 +31,8 @@ impl Default for EffectiveConfig {
             cxx_stdlib: CxxStdlib::PlatformDefault,
             lto: false,
             flags: Vec::new(),
+            c_flags: Vec::new(),
+            cxx_flags: Vec::new(),
             cmake_options: BTreeMap::new(),
         }
     }
@@ -61,6 +68,22 @@ impl EffectiveConfig {
         for flag in flags {
             if !self.flags.contains(flag) {
                 self.flags.push(flag.clone());
+            }
+        }
+    }
+
+    pub fn add_c_flags(&mut self, flags: &[String]) {
+        for flag in flags {
+            if !self.c_flags.contains(flag) {
+                self.c_flags.push(flag.clone());
+            }
+        }
+    }
+
+    pub fn add_cxx_flags(&mut self, flags: &[String]) {
+        for flag in flags {
+            if !self.cxx_flags.contains(flag) {
+                self.cxx_flags.push(flag.clone());
             }
         }
     }
