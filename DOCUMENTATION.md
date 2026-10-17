@@ -137,7 +137,7 @@ What is different from `cmake-install`:
 
 #### Import modes
 
-- **`find_package` mode** (default): after building, UniDeps calls `find_package(<import_name or detected config name> CONFIG)` against the install prefix and reports the imported targets. Configure fails with a clear message if no config package is installed.
+- **`find_package` mode** (default): after building, UniDeps calls `find_package(<import_name or detected config name> CONFIG)` against the install prefix and reports the imported targets. The call is restricted to `CMAKE_PREFIX_PATH`/`<Pkg>_ROOT` -- it cannot fall back to a same-named package already installed on the system. Configure fails with a clear message if no config package is installed.
 - **`auto_import` mode**: UniDeps creates `<name>::<name>` (and a plain `<name>` alias). It is `SHARED IMPORTED` when a DLL is found for a shared build, `INTERFACE IMPORTED` for header-only packages, and `UNKNOWN IMPORTED` otherwise. Dependencies listed in `dependencies` are linked to it.
 
 In both modes, `<NAME>_ROOT` variables and `CMAKE_PREFIX_PATH` entries are set so that plain `find_package(<Name>)` calls in your project also work.

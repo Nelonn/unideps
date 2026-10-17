@@ -351,10 +351,14 @@ endif()
                     let found_var = format!("_unideps_{name}_found");
                     writeln!(&mut out, "set({found_var} FALSE)").unwrap();
 
+                    // Restricted to CMAKE_PREFIX_PATH / <Pkg>_ROOT (set above for this node) so a
+                    // same-named package already installed on the system is never picked up in
+                    // place of the one unideps just built -- that would silently defeat version
+                    // pinning instead of failing loudly.
                     for pkg in &attempted_packages {
                         let pkg_upper = pkg.to_uppercase();
                         writeln!(&mut out, "if(NOT {found_var})").unwrap();
-                        writeln!(&mut out, "    find_package({pkg} CONFIG QUIET)").unwrap();
+                        writeln!(&mut out, "    find_package({pkg} CONFIG QUIET NO_CMAKE_ENVIRONMENT_PATH NO_SYSTEM_ENVIRONMENT_PATH NO_CMAKE_PACKAGE_REGISTRY NO_CMAKE_SYSTEM_PATH NO_SYSTEM_PACKAGE_REGISTRY)").unwrap();
                         writeln!(&mut out, "    if({pkg}_FOUND OR {pkg_upper}_FOUND)").unwrap();
                         writeln!(&mut out, "        set({found_var} TRUE)").unwrap();
                         writeln!(&mut out, "        set(_unideps_{name}_imported_pkg \"{pkg}\")").unwrap();
@@ -842,7 +846,10 @@ mod tests {
         node.install_prefix = Some(std::path::PathBuf::from("C:/mock/prefix"));
 
         let content = CMakeGenerator::generate_targets_cmake(&[&node]);
-        assert!(content.contains("find_package(WebP CONFIG QUIET)"));
+        assert!(content.contains(
+            "find_package(WebP CONFIG QUIET NO_CMAKE_ENVIRONMENT_PATH NO_SYSTEM_ENVIRONMENT_PATH \
+             NO_CMAKE_PACKAGE_REGISTRY NO_CMAKE_SYSTEM_PATH NO_SYSTEM_PACKAGE_REGISTRY)"
+        ));
         assert!(content.contains("message(FATAL_ERROR \"UniDeps: could not resolve dependency 'webp' via find_package CONFIG in C:/mock/prefix\")"));
         assert!(!content.contains("add_library(webp::webp UNKNOWN IMPORTED)"));
         assert!(content.contains("set(_unideps_webp_ver \"v1.3.2\")"));
