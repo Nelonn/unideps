@@ -358,7 +358,7 @@ endif()
                     for pkg in &attempted_packages {
                         let pkg_upper = pkg.to_uppercase();
                         writeln!(&mut out, "if(NOT {found_var})").unwrap();
-                        writeln!(&mut out, "    find_package({pkg} CONFIG QUIET NO_CMAKE_ENVIRONMENT_PATH NO_SYSTEM_ENVIRONMENT_PATH NO_CMAKE_PACKAGE_REGISTRY NO_CMAKE_SYSTEM_PATH NO_SYSTEM_PACKAGE_REGISTRY)").unwrap();
+                        writeln!(&mut out, "    find_package({pkg} CONFIG QUIET NO_CMAKE_ENVIRONMENT_PATH NO_SYSTEM_ENVIRONMENT_PATH NO_CMAKE_PACKAGE_REGISTRY NO_CMAKE_SYSTEM_PATH NO_CMAKE_SYSTEM_PACKAGE_REGISTRY)").unwrap();
                         writeln!(&mut out, "    if({pkg}_FOUND OR {pkg_upper}_FOUND)").unwrap();
                         writeln!(&mut out, "        set({found_var} TRUE)").unwrap();
                         writeln!(&mut out, "        set(_unideps_{name}_imported_pkg \"{pkg}\")").unwrap();
@@ -848,7 +848,7 @@ mod tests {
         let content = CMakeGenerator::generate_targets_cmake(&[&node]);
         assert!(content.contains(
             "find_package(WebP CONFIG QUIET NO_CMAKE_ENVIRONMENT_PATH NO_SYSTEM_ENVIRONMENT_PATH \
-             NO_CMAKE_PACKAGE_REGISTRY NO_CMAKE_SYSTEM_PATH NO_SYSTEM_PACKAGE_REGISTRY)"
+             NO_CMAKE_PACKAGE_REGISTRY NO_CMAKE_SYSTEM_PATH NO_CMAKE_SYSTEM_PACKAGE_REGISTRY)"
         ));
         assert!(content.contains("message(FATAL_ERROR \"UniDeps: could not resolve dependency 'webp' via find_package CONFIG in C:/mock/prefix\")"));
         assert!(!content.contains("add_library(webp::webp UNKNOWN IMPORTED)"));
