@@ -26,7 +26,7 @@ use crate::storage::StorageManager;
 
 /// Bump when the fields below change meaning; records written by an older unideps are
 /// then ignored instead of misread.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resolution {

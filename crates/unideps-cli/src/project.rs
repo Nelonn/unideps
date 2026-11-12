@@ -19,16 +19,6 @@ pub struct Project {
 
 impl Project {
     pub fn load(manifest_path: &Path) -> Result<Self> {
-        Self::load_with(manifest_path, true)
-    }
-
-    /// Manifest of a dependency's source tree. Storage, tools and resource limits
-    /// belong to the outer project, so a `.local.toml` shipped in the source is ignored.
-    pub fn load_nested(manifest_path: &Path) -> Result<Self> {
-        Self::load_with(manifest_path, false)
-    }
-
-    fn load_with(manifest_path: &Path, read_local: bool) -> Result<Self> {
         if !manifest_path.exists() {
             anyhow::bail!("Manifest file not found: {}", manifest_path.display());
         }
@@ -36,7 +26,7 @@ impl Project {
         let manifest_dir = manifest_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
         let manifest = Manifest::from_file(&manifest_path)?;
         let local_path = manifest_dir.join(".local.toml");
-        let local = if read_local && local_path.exists() {
+        let local = if local_path.exists() {
             Some(LocalConfig::from_file(&local_path)?)
         } else {
             None
@@ -429,13 +419,32 @@ keep_build_dirs = true
     }
 
     #[test]
-    fn nested_manifest_ignores_local_toml() {
+    fn nested_manifest_applies_its_own_local_overrides() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("unideps.toml"), "").unwrap();
-        std::fs::write(temp.path().join(".local.toml"), "[storage
-").unwrap();
-        let p = Project::load_nested(&temp.path().join("unideps.toml")).unwrap();
-        assert!(p.local.is_none());
+        let nested = temp.path().join("subdir");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(temp.path().join(".local.toml"), "[overrides.dep]\npath = 'outer'\n").unwrap();
+        std::fs::write(
+            nested.join("unideps.toml"),
+            "[dependencies.dep]\ngit = 'original'\n[overrides.dep]\npath = 'manifest'\n",
+        ).unwrap();
+        std::fs::write(nested.join(".local.toml"), "[overrides.dep]\npath = 'local'\n").unwrap();
+
+        let p = Project::load(&nested.join("unideps.toml")).unwrap();
+        let graph = p.build_graph().unwrap();
+        let dep = graph.graph.node_weights().find(|n| n.name == "dep").unwrap();
+        assert_eq!(dep.path.as_deref(), Some(nested.join("local").as_path()));
+    }
+
+    #[test]
+    fn broken_nested_local_toml_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("subdir");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("unideps.toml"), "").unwrap();
+        std::fs::write(nested.join(".local.toml"), "[storage\n").unwrap();
+        let err = Project::load(&nested.join("unideps.toml")).err().unwrap().to_string();
+        assert!(err.contains(".local.toml"), "{err}");
     }
 
     #[test]

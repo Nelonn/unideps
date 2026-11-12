@@ -100,6 +100,8 @@ fn android_abi(arch: Arch) -> &'static str {
 
 struct BuildContext<'a> {
     project: &'a Project,
+    /// Enclosing projects, nearest first, for local runtime defaults.
+    parents: Vec<&'a Project>,
     target: TargetTriple,
     host: TargetTriple,
     strategy: StrategyEngine,
@@ -132,13 +134,14 @@ struct Built {
 }
 
 impl<'a> BuildContext<'a> {
-    /// Same target and toolchain, but the strategy rules of another manifest.
-    fn with_strategy(&self, strategy: StrategyEngine) -> BuildContext<'a> {
+    /// Same storage, target and toolchain, with the nested manifest's local settings.
+    fn with_project<'b>(&'b self, project: &'b Project) -> BuildContext<'b> {
         BuildContext {
-            project: self.project,
+            project,
+            parents: std::iter::once(self.project).chain(self.parents.iter().copied()).collect(),
             target: self.target.clone(),
             host: self.host.clone(),
-            strategy,
+            strategy: StrategyEngine::new(&project.manifest.strategy),
             storage: self.storage,
             sources: self.sources,
             targets_dir: self.targets_dir.clone(),
@@ -152,6 +155,24 @@ impl<'a> BuildContext<'a> {
             forwarded: self.forwarded.clone(),
             vars: self.vars.clone(),
         }
+    }
+
+    fn projects(&self) -> impl Iterator<Item = &Project> {
+        std::iter::once(self.project).chain(self.parents.iter().copied())
+    }
+
+    fn local_tool_path(&self, name: &str) -> Option<PathBuf> {
+        self.projects().find_map(|p| p.local_tool_path(name))
+    }
+
+    fn max_jobs(&self) -> Option<usize> {
+        self.projects().find_map(Project::max_jobs)
+    }
+
+    fn keep_build_dirs(&self) -> bool {
+        self.projects()
+            .find_map(|p| p.local.as_ref()?.storage.as_ref()?.keep_build_dirs)
+            .unwrap_or_else(|| self.project.keep_build_dirs())
     }
 
     fn is_native(&self) -> bool {
@@ -352,6 +373,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     let sources = Sources::new(&storage);
     let ctx = BuildContext {
         project: &project,
+        parents: Vec::new(),
         host_compiler: detect_default_compiler(&host),
         target,
         host,
@@ -437,24 +459,41 @@ fn preflight(ctx: &BuildContext, graph: &DependencyGraph) -> Result<()> {
     Ok(())
 }
 
-/// Builds every node of `graph` in dependency order. The result lists the packages
-/// pulled in by nested manifests first, then the graph's own nodes.
+/// Builds every node of `graph` in dependency order, then orders the merged graph
+/// including dependencies discovered through nested manifests.
 fn build_project(ctx: &BuildContext, graph: &mut DependencyGraph, stack: &mut NestedStack) -> Result<Vec<DependencyNode>> {
     let mut nested: Vec<DependencyNode> = Vec::new();
     let mut direct: Vec<DependencyNode> = Vec::new();
     for idx in graph.topological_order()? {
-        let built = build_node(ctx, graph, idx, stack)?;
+        let mut built = build_node(ctx, graph, idx, stack)?;
+        // Persist only edges that survived this manifest's filtering. A later
+        // outer manifest may introduce a package with the same filtered name.
+        built.node.dependencies.retain(|name| graph.indices.contains_key(name));
+        built.node.tools.retain(|name| graph.indices.contains_key(name));
+        retain_nested_dependencies(&mut built.node, &built.nested);
         graph.graph[idx] = built.node.clone();
         nested.extend(built.nested);
         direct.push(built.node);
     }
-    Ok(merge_nested(nested, direct))
+    merge_nested(nested, direct)
+}
+
+// Keep the edges as well as the flattened nodes. The same names may be resolved
+// to an outer manifest's packages later, including when loading a resolution record.
+fn retain_nested_dependencies(node: &mut DependencyNode, nested: &[DependencyNode]) {
+    for dependency in nested {
+        if !node.dependencies.contains(&dependency.name) {
+            node.dependencies.push(dependency.name.clone());
+        }
+    }
 }
 
 /// A package the project (or an outer manifest) declares itself wins over the same
 /// name coming from a nested manifest; between nested ones the first wins. Each
-/// package appears once so that the generated targets do not clash.
-fn merge_nested(nested: Vec<DependencyNode>, direct: Vec<DependencyNode>) -> Vec<DependencyNode> {
+/// package appears once so that the generated targets do not clash. Rebuild the
+/// graph after selecting winners: an outer package can replace a nested dependency
+/// that must still be imported before its nested dependents.
+fn merge_nested(nested: Vec<DependencyNode>, direct: Vec<DependencyNode>) -> Result<Vec<DependencyNode>> {
     let mut kept: HashMap<String, Option<PathBuf>> = direct
         .iter()
         .map(|n| (n.name.clone(), n.install_prefix.clone()))
@@ -477,7 +516,25 @@ fn merge_nested(nested: Vec<DependencyNode>, direct: Vec<DependencyNode>) -> Vec
         }
     }
     merged.extend(direct);
-    merged
+    let mut graph = DependencyGraph::new();
+    for node in merged {
+        graph.add_or_get_node(node);
+    }
+    let mut edges = Vec::new();
+    for idx in graph.graph.node_indices() {
+        let node = &graph.graph[idx];
+        for name in node.dependencies.iter().chain(&node.tools) {
+            // Conditional and platform filtering can have removed a declared node.
+            if let Some(&dependency) = graph.indices.get(name) {
+                edges.push((idx, dependency));
+            }
+        }
+    }
+    for (dependent, dependency) in edges {
+        graph.add_dependency(dependent, dependency);
+    }
+    let order = graph.topological_order().context("Ordering merged nested dependencies")?;
+    Ok(order.into_iter().map(|idx| graph.graph[idx].clone()).collect())
 }
 
 /// Dependencies declared by the `unideps.toml` inside a dependency's source tree.
@@ -508,7 +565,7 @@ fn build_nested(
     }
     println!("[NESTED] {} ({})", node.name, manifest.display());
 
-    let project = Project::load_nested(&manifest)?;
+    let project = Project::load(&manifest)?;
     let mut graph = project.build_graph()?;
     // `enabled_if` refers to the options of the package itself, i.e. its own `option()`
     // defaults overridden by what it is configured with, not to the options of this project.
@@ -520,7 +577,7 @@ fn build_nested(
     options.extend(node.cmake_options.iter().map(|(k, v)| (k.clone(), v.clone())));
     connect_graph(&mut graph, &ctx.target, &options)?;
 
-    let nested_ctx = ctx.with_strategy(StrategyEngine::new(&project.manifest.strategy));
+    let nested_ctx = ctx.with_project(&project);
     preflight(&nested_ctx, &graph).with_context(|| format!("In the nested unideps.toml of '{}'", node.name))?;
     stack.push((node.name.clone(), source_id.to_string()));
     let built = build_project(&nested_ctx, &mut graph, stack);
@@ -571,13 +628,13 @@ fn probe_options(
         Ok(()) if out.is_file() => Some(std::fs::read_to_string(&out)?),
         Ok(()) => None,
         Err(e) => {
-            if !ctx.project.keep_build_dirs() {
+            if !ctx.keep_build_dirs() {
                 let _ = GitSource::remove_dir_all_force(&scratch);
             }
             return Err(e);
         }
     };
-    if !ctx.project.keep_build_dirs() {
+    if !ctx.keep_build_dirs() {
         let _ = GitSource::remove_dir_all_force(&scratch);
     }
 
@@ -676,13 +733,15 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
     ctx.configure_node(&mut node, &dependents)?;
 
     if node.kind == NodeKind::HostTool
-        && let Some(local) = ctx.project.local_tool_path(&node.name)
+        && let Some(local) = ctx.local_tool_path(&node.name)
     {
         if !local.exists() {
             anyhow::bail!("Local tool path for '{}' does not exist: {}", node.name, local.display());
         }
         println!("[LOCAL] {} ({})", node.name, local.display());
         node.build_id = Some(HashCalculator::short_hash(&local.to_string_lossy()));
+        // Local tools must keep enclosing resolution records mutable too.
+        node.path = Some(local.clone());
         node.install_prefix = Some(local);
         return Ok(Built { node, nested: Vec::new() });
     }
@@ -746,7 +805,7 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
     // Recording the rest is best effort: the only loss is that the next run resolves again.
     let recordable = nested_nodes
         .iter()
-        .all(|n| is_recordable(n) && ctx.project.local_tool_path(&n.name).is_none());
+        .all(|n| is_recordable(n) && ctx.local_tool_path(&n.name).is_none());
     let done = |node: DependencyNode| {
         let built = Built { node, nested: nested_nodes.to_vec() };
         if recordable {
@@ -829,7 +888,7 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
     Packager::pack_dir_to_zst(&install_dir, &cached_archive)?;
     StorageManager::mark_installed(&install_dir)?;
 
-    if !ctx.project.keep_build_dirs() {
+    if !ctx.keep_build_dirs() {
         let _ = GitSource::remove_dir_all_force(&build_scratch);
     }
     Ok(done(node))
@@ -920,7 +979,7 @@ fn run_cmake(
         cxx_std: &node.config.cxx_std,
         cxx_stdlib: node.config.cxx_stdlib,
         lto: node.config.lto,
-        jobs: ctx.project.max_jobs(),
+        jobs: ctx.max_jobs(),
         collect_pdbs: triple.os == Os::Windows,
         isolate_env: node.kind == NodeKind::HostTool && !ctx.is_native(),
     };
@@ -1037,7 +1096,7 @@ fn fetch_project(project: &Project, sources: &Sources, visited: &mut BTreeSet<Pa
 
         let manifest = dir.join("unideps.toml");
         if node.kind == NodeKind::TargetDependency && manifest.is_file() && visited.insert(dir) {
-            let nested = Project::load_nested(&manifest)?;
+            let nested = Project::load(&manifest)?;
             fetch_project(&nested, sources, visited)
                 .with_context(|| format!("In the nested unideps.toml of '{}'", node.name))?;
         }
@@ -1049,6 +1108,66 @@ fn fetch_project(project: &Project, sources: &Sources, visited: &mut BTreeSet<Pa
 mod tests {
     use super::*;
     use unideps_core::manifest::{DependencyDetails, DependencySpec};
+
+    #[test]
+    fn nested_build_uses_local_tools_and_inherits_runtime_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let nested_dir = root.join("nested");
+        std::fs::create_dir(&nested_dir).unwrap();
+        std::fs::create_dir(root.join("outer-tool")).unwrap();
+        std::fs::create_dir(nested_dir.join("inner-tool")).unwrap();
+        std::fs::write(root.join("unideps.toml"), "").unwrap();
+        std::fs::write(
+            root.join(".local.toml"),
+            "[tools]\nouter = 'outer-tool'\ninner = 'wrong-tool'\n[resources]\nmax_jobs = 7\n[storage]\nkeep_build_dirs = true\n",
+        ).unwrap();
+        std::fs::write(
+            nested_dir.join("unideps.toml"),
+            "[tools.inner]\ngit = 'unused'\n[tools.outer]\ngit = 'unused'\n",
+        ).unwrap();
+        std::fs::write(
+            nested_dir.join(".local.toml"),
+            "[tools]\ninner = 'inner-tool'\n[storage]\nkeep_build_dirs = false\n",
+        ).unwrap();
+        let project = Project::load(&root.join("unideps.toml")).unwrap();
+        let storage = StorageManager::new(root.join("store"));
+        let sources = Sources::new(&storage);
+        let host = TargetTriple::host();
+        let ctx = BuildContext {
+            project: &project,
+            parents: Vec::new(),
+            target: host.clone(),
+            host: host.clone(),
+            strategy: StrategyEngine::new(&project.manifest.strategy),
+            storage: &storage,
+            sources: &sources,
+            targets_dir: root.join("targets"),
+            c_compiler: None,
+            cxx_compiler: None,
+            toolchain_file: None,
+            target_compiler: detect_default_compiler(&host),
+            host_compiler: detect_default_compiler(&host),
+            target_base: EffectiveConfig::default(),
+            default_shared: None,
+            forwarded: BTreeMap::new(),
+            vars: BTreeMap::new(),
+        };
+        let nested_project = Project::load(&nested_dir.join("unideps.toml")).unwrap();
+        let nested_ctx = ctx.with_project(&nested_project);
+        assert_eq!(nested_ctx.max_jobs(), Some(7));
+        assert!(!nested_ctx.keep_build_dirs());
+        assert!(ctx.keep_build_dirs());
+
+        let nested = build_nested(&ctx, &node("parent", ""), &[], &nested_dir, "source", &mut Vec::new())
+            .unwrap().unwrap();
+        assert_eq!(nested.nodes.len(), 2);
+        for built in &nested.nodes {
+            let expected = if built.name == "inner" { nested_dir.join("inner-tool") } else { root.join("outer-tool") };
+            assert_eq!(built.install_prefix.as_ref(), Some(&expected));
+            assert!(!is_recordable(built));
+        }
+    }
 
     fn node(name: &str, prefix: &str) -> DependencyNode {
         let mut n = DependencyNode::from_target_dep(name, &DependencySpec::Detailed(DependencyDetails::default()));
@@ -1090,21 +1209,110 @@ mod tests {
 
     #[test]
     fn nested_packages_come_first() {
-        let merged = merge_nested(vec![node("b", "/b")], vec![node("a", "/a")]);
+        let merged = merge_nested(vec![node("b", "/b")], vec![node("a", "/a")]).unwrap();
         assert_eq!(names(&merged), [("b", "/b"), ("a", "/a")]);
     }
 
     #[test]
     fn declared_package_wins_over_nested_one() {
-        let merged = merge_nested(vec![node("b", "/nested/b")], vec![node("b", "/own/b")]);
+        let merged = merge_nested(vec![node("b", "/nested/b")], vec![node("b", "/own/b")]).unwrap();
         assert_eq!(names(&merged), [("b", "/own/b")]);
     }
 
     #[test]
     fn first_nested_package_wins_and_identical_ones_are_merged() {
         let nested = vec![node("b", "/b1"), node("b", "/b2"), node("c", "/c"), node("c", "/c")];
-        let merged = merge_nested(nested, Vec::new());
+        let merged = merge_nested(nested, Vec::new()).unwrap();
         assert_eq!(names(&merged), [("b", "/b1"), ("c", "/c")]);
+    }
+
+    #[test]
+    fn outer_dependency_precedes_its_deeply_nested_dependents() {
+        let mut regfx = node("regfx", "/regfx");
+        let headers = vec![node("vulkanheaders", "/nested/headers")];
+        retain_nested_dependencies(&mut regfx, &headers);
+        let regfx_nodes = merge_nested(headers, vec![regfx]).unwrap();
+        let mut rewidget = node("rewidget", "/rewidget");
+        retain_nested_dependencies(&mut rewidget, &regfx_nodes);
+        let rewidget_nodes = merge_nested(regfx_nodes, vec![rewidget]).unwrap();
+        let mut ui = node("ui", "/ui");
+        retain_nested_dependencies(&mut ui, &rewidget_nodes);
+        // Same flattened representation that a resolution record restores.
+        let ui_nodes = merge_nested(rewidget_nodes, vec![ui]).unwrap();
+        let serialized = toml::to_string(&BTreeMap::from([("nodes", ui_nodes)])).unwrap();
+        let mut record: BTreeMap<String, Vec<DependencyNode>> = toml::from_str(&serialized).unwrap();
+        let restored = record.remove("nodes").unwrap();
+        let merged = merge_nested(restored, vec![node("vulkanheaders", "/outer/headers")]).unwrap();
+        assert_eq!(names(&merged), [
+            ("vulkanheaders", "/outer/headers"), ("regfx", "/regfx"),
+            ("rewidget", "/rewidget"), ("ui", "/ui"),
+        ]);
+        let refs: Vec<_> = merged.iter().collect();
+        let targets = CMakeGenerator::generate_targets_cmake(&refs);
+        assert!(targets.find("find_package(vulkanheaders ").unwrap()
+            < targets.find("find_package(regfx ").unwrap());
+    }
+
+    #[test]
+    fn generated_cmake_loads_nested_package_after_shared_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let header_prefix = root.join("headers");
+        std::fs::create_dir_all(header_prefix.join("include")).unwrap();
+        let package_prefix = root.join("regfx/lib/cmake/regfx");
+        std::fs::create_dir_all(&package_prefix).unwrap();
+        std::fs::write(package_prefix.join("regfxConfig.cmake"), r#"
+if(NOT TARGET vulkanheaders::vulkanheaders)
+    set(regfx_FOUND FALSE)
+    set(regfx_NOT_FOUND_MESSAGE "Vulkan header target is not available yet")
+    return()
+endif()
+add_library(regfx::regfx INTERFACE IMPORTED)
+set_target_properties(regfx::regfx PROPERTIES INTERFACE_LINK_LIBRARIES vulkanheaders::vulkanheaders)
+"#).unwrap();
+        let mut regfx = node("regfx", root.join("regfx").to_str().unwrap());
+        let nested_headers = vec![node("vulkanheaders", "/nested/headers")];
+        retain_nested_dependencies(&mut regfx, &nested_headers);
+        let mut headers = node("vulkanheaders", header_prefix.to_str().unwrap());
+        headers.header_only = true;
+        headers.import_name = Some("VulkanHeaders".into());
+        let merged = merge_nested(vec![nested_headers[0].clone(), regfx], vec![headers]).unwrap();
+        let refs: Vec<_> = merged.iter().collect();
+        let targets = CMakeGenerator::generate_targets_cmake(&refs);
+        std::fs::write(root.join("unideps_targets.cmake"), targets).unwrap();
+        std::fs::write(root.join("CMakeLists.txt"), r#"
+cmake_minimum_required(VERSION 3.20)
+project(nested_import NONE)
+include("${CMAKE_CURRENT_SOURCE_DIR}/unideps_targets.cmake")
+if(NOT TARGET regfx::regfx OR NOT TARGET VulkanHeaders::VulkanHeaders)
+    message(FATAL_ERROR "The merged graph did not import its targets")
+endif()
+"#).unwrap();
+        let output = std::process::Command::new("cmake")
+            .arg("-S").arg(root).arg("-B").arg(root.join("build"))
+            .output().expect("CMake is required for the generated targets regression test");
+        assert!(output.status.success(), "{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn merged_dependency_cycle_is_reported() {
+        let mut nested = node("regfx", "/regfx");
+        nested.dependencies.push("vulkanheaders".into());
+        let mut outer = node("vulkanheaders", "/headers");
+        outer.dependencies.push("regfx".into());
+        let error = merge_nested(vec![nested], vec![outer]).unwrap_err();
+        assert!(format!("{error:#}").contains("Cycle"));
+    }
+
+    #[test]
+    fn winning_package_keeps_its_own_dependencies() {
+        let mut discarded = node("headers", "/discarded");
+        discarded.dependencies.push("regfx".into());
+        let mut regfx = node("regfx", "/regfx");
+        regfx.dependencies.push("headers".into());
+        let merged = merge_nested(vec![discarded, regfx], vec![node("headers", "/winner")]).unwrap();
+        assert_eq!(names(&merged), [("headers", "/winner"), ("regfx", "/regfx")]);
     }
 
     #[test]
