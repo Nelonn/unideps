@@ -436,9 +436,10 @@ endif()
                 file.to_string_lossy().replace('\\', "/"),
             ));
         }
-        if let Some(shared) = node.shared {
-            set_before.push(("BUILD_SHARED_LIBS".into(), if shared { "ON".into() } else { "OFF".into() }));
-        }
+        // Resolved the same way as for a package unideps builds itself: `shared` of the
+        // dependency, else its `[[strategy]]` rules, else the consumer's BUILD_SHARED_LIBS.
+        let shared = node.shared.unwrap_or(node.config.shared);
+        set_before.push(("BUILD_SHARED_LIBS".into(), if shared { "ON".into() } else { "OFF".into() }));
         // Already resolved by the run that prepared the sources, so that `${<dep>.prefix}`
         // means here exactly what it means on the configure command line of a normal build.
         for (k, v) in &node.subdir_options {

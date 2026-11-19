@@ -105,6 +105,10 @@ struct BuildContext<'a> {
     target: TargetTriple,
     host: TargetTriple,
     strategy: StrategyEngine,
+    /// `[[strategy]]` rules of the enclosing projects, innermost first, each with the
+    /// packages that pull this manifest in as that project sees them: its `cascade` rules
+    /// reach through a nested manifest just like through a direct dependency.
+    enclosing: Vec<(StrategyEngine, Vec<String>)>,
     storage: &'a StorageManager,
     /// Shared for the whole run so that a checkout is brought up to date only once.
     sources: &'a Sources<'a>,
@@ -135,13 +139,25 @@ struct Built {
 
 impl<'a> BuildContext<'a> {
     /// Same storage, target and toolchain, with the nested manifest's local settings.
-    fn with_project<'b>(&'b self, project: &'b Project) -> BuildContext<'b> {
+    /// `owner` is the package whose sources hold that manifest and `owner_dependents`
+    /// the packages of this project that depend on it.
+    fn with_project<'b>(&'b self, project: &'b Project, owner: &str, owner_dependents: &[&str]) -> BuildContext<'b> {
+        let chain: Vec<String> = std::iter::once(owner)
+            .chain(owner_dependents.iter().copied())
+            .map(String::from)
+            .collect();
+        let enclosing = std::iter::once((self.strategy.clone(), chain.clone()))
+            .chain(self.enclosing.iter().map(|(engine, outer)| {
+                (engine.clone(), outer.iter().chain(&chain).cloned().collect())
+            }))
+            .collect();
         BuildContext {
             project,
             parents: std::iter::once(self.project).chain(self.parents.iter().copied()).collect(),
             target: self.target.clone(),
             host: self.host.clone(),
             strategy: StrategyEngine::new(&project.manifest.strategy),
+            enclosing,
             storage: self.storage,
             sources: self.sources,
             targets_dir: self.targets_dir.clone(),
@@ -203,8 +219,11 @@ impl<'a> BuildContext<'a> {
     fn configure_node(&self, node: &mut DependencyNode, dependents: &[&str]) -> Result<()> {
         let base = match node.kind {
             NodeKind::TargetDependency => {
-                if node.shared.is_none() {
-                    node.shared = self.default_shared;
+                // The consumer's BUILD_SHARED_LIBS is only the starting point: `[[strategy]]`
+                // rules override it, and `shared` set on the dependency itself overrides both.
+                let mut base = self.target_base.clone();
+                if let Some(shared) = self.default_shared {
+                    base.shared = shared;
                 }
                 // Stored in node options so they are hashed: ANDROID_STL changes the ABI.
                 for (k, v) in &self.forwarded {
@@ -215,7 +234,7 @@ impl<'a> BuildContext<'a> {
                         .insert("ANDROID_ABI".into(), android_abi(self.target.arch).into());
                 }
                 node.compiler = Some(self.target_compiler.clone());
-                self.target_base.clone()
+                base
             }
             NodeKind::HostTool => {
                 node.compiler = Some(if self.is_native() {
@@ -226,7 +245,18 @@ impl<'a> BuildContext<'a> {
                 EffectiveConfig::default()
             }
         };
-        node.config = self.strategy.resolve_for_node(&node.name, dependents, &base);
+        // The rules of the nested manifest itself first, then those of the projects around
+        // it, outermost last: the consuming project has the final say over what it pulls in.
+        let mut config = self.strategy.resolve_for_node(&node.name, dependents, &base);
+        for (engine, outer) in &self.enclosing {
+            let all: Vec<&str> = dependents
+                .iter()
+                .copied()
+                .chain(outer.iter().map(String::as_str))
+                .collect();
+            config = engine.resolve_for_node(&node.name, &all, &config);
+        }
+        node.config = config;
         let (cc, cxx, tf) = self.compilers_for(node);
         node.toolchain_fingerprint = toolchain_fingerprint(cc, cxx, tf);
 
@@ -378,6 +408,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         target,
         host,
         strategy: StrategyEngine::new(&m.strategy),
+        enclosing: Vec::new(),
         storage: &storage,
         sources: &sources,
         targets_dir,
@@ -550,6 +581,7 @@ struct Nested {
 fn build_nested(
     ctx: &BuildContext,
     node: &DependencyNode,
+    dependents: &[&str],
     dep_nodes: &[&DependencyNode],
     src_dir: &Path,
     source_id: &str,
@@ -577,7 +609,7 @@ fn build_nested(
     options.extend(node.cmake_options.iter().map(|(k, v)| (k.clone(), v.clone())));
     connect_graph(&mut graph, &ctx.target, &options)?;
 
-    let nested_ctx = ctx.with_project(&project);
+    let nested_ctx = ctx.with_project(&project, &node.name, dependents);
     preflight(&nested_ctx, &graph).with_context(|| format!("In the nested unideps.toml of '{}'", node.name))?;
     stack.push((node.name.clone(), source_id.to_string()));
     let built = build_project(&nested_ctx, &mut graph, stack);
@@ -779,7 +811,7 @@ fn build_node(ctx: &BuildContext, graph: &DependencyGraph, idx: NodeIndex, stack
     // even when the package itself is cached; an existing checkout is reused offline.
     let src_dir = sources.prepared_source(&node, &source_id)?;
     let direct_deps: Vec<&DependencyNode> = deps.iter().map(|&d| &graph.graph[d]).collect();
-    let nested = build_nested(ctx, &node, &direct_deps, &src_dir, &source_id, stack)?;
+    let nested = build_nested(ctx, &node, &dependents, &direct_deps, &src_dir, &source_id, stack)?;
     let nested_nodes: &[DependencyNode] = nested.as_ref().map_or(&[], |n| n.nodes.as_slice());
 
     dep_build_ids.extend(nested_nodes.iter().filter_map(|n| n.build_id.as_deref()));
@@ -1140,6 +1172,7 @@ mod tests {
             target: host.clone(),
             host: host.clone(),
             strategy: StrategyEngine::new(&project.manifest.strategy),
+            enclosing: Vec::new(),
             storage: &storage,
             sources: &sources,
             targets_dir: root.join("targets"),
@@ -1154,12 +1187,12 @@ mod tests {
             vars: BTreeMap::new(),
         };
         let nested_project = Project::load(&nested_dir.join("unideps.toml")).unwrap();
-        let nested_ctx = ctx.with_project(&nested_project);
+        let nested_ctx = ctx.with_project(&nested_project, "parent", &[]);
         assert_eq!(nested_ctx.max_jobs(), Some(7));
         assert!(!nested_ctx.keep_build_dirs());
         assert!(ctx.keep_build_dirs());
 
-        let nested = build_nested(&ctx, &node("parent", ""), &[], &nested_dir, "source", &mut Vec::new())
+        let nested = build_nested(&ctx, &node("parent", ""), &[], &[], &nested_dir, "source", &mut Vec::new())
             .unwrap().unwrap();
         assert_eq!(nested.nodes.len(), 2);
         for built in &nested.nodes {
@@ -1167,6 +1200,59 @@ mod tests {
             assert_eq!(built.install_prefix.as_ref(), Some(&expected));
             assert!(!is_recordable(built));
         }
+    }
+
+    /// The consumer's BUILD_SHARED_LIBS is a default the `[[strategy]]` rules override, and a
+    /// `cascade` rule reaches the dependencies a package pulls in through its own manifest.
+    #[test]
+    fn strategy_beats_default_shared_and_cascades_into_nested_manifests() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let nested_dir = root.join("nested");
+        std::fs::create_dir(&nested_dir).unwrap();
+        std::fs::write(
+            root.join("unideps.toml"),
+            "[dependencies.media]\npath = 'nested'\n[[strategy]]\npackage = 'media'\nscope = 'cascade'\nshared = false\n",
+        ).unwrap();
+        std::fs::write(nested_dir.join("unideps.toml"), "[dependencies.codec]\npath = '.'\n").unwrap();
+        let project = Project::load(&root.join("unideps.toml")).unwrap();
+        let nested_project = Project::load(&nested_dir.join("unideps.toml")).unwrap();
+        let storage = StorageManager::new(root.join("store"));
+        let sources = Sources::new(&storage);
+        let host = TargetTriple::host();
+        let ctx = BuildContext {
+            project: &project,
+            parents: Vec::new(),
+            target: host.clone(),
+            host: host.clone(),
+            strategy: StrategyEngine::new(&project.manifest.strategy),
+            enclosing: Vec::new(),
+            storage: &storage,
+            sources: &sources,
+            targets_dir: root.join("targets"),
+            c_compiler: None,
+            cxx_compiler: None,
+            toolchain_file: None,
+            target_compiler: detect_default_compiler(&host),
+            host_compiler: detect_default_compiler(&host),
+            target_base: EffectiveConfig::default(),
+            default_shared: Some(true),
+            forwarded: BTreeMap::new(),
+            vars: BTreeMap::new(),
+        };
+        let resolved = |ctx: &BuildContext, name: &str| {
+            let mut n = node(name, "");
+            ctx.configure_node(&mut n, &[]).unwrap();
+            n.shared.unwrap_or(n.config.shared)
+        };
+
+        assert!(!resolved(&ctx, "media"));
+        assert!(resolved(&ctx, "unrelated"), "BUILD_SHARED_LIBS of the consumer is the default");
+
+        let nested_ctx = ctx.with_project(&nested_project, "media", &[]);
+        assert!(!resolved(&nested_ctx, "codec"), "cascade of 'media' reaches its own dependencies");
+        let other_ctx = ctx.with_project(&nested_project, "unrelated", &[]);
+        assert!(resolved(&other_ctx, "codec"));
     }
 
     fn node(name: &str, prefix: &str) -> DependencyNode {
